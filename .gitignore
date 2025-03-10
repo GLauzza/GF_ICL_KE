@@ -172,3 +172,6 @@ Qwen_Qwen2.5-0.5B_*.json
 # Models
 torch_model
 gguf_ggml_models
+
+# Plots
+*.png

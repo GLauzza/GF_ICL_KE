@@ -1,7 +1,9 @@
 {
   "insertion_type": "single",
-  "layer_to_modify": 20,
+  "layer_to_modify": 23,
   "n_tok_start": -1,
   "n_tok_stop": -1,
-  "method": "classic"
+  "method": "generalisation",
+  "strength": 1000.0,
+  "treshold": 0.99
 } 

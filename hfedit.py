@@ -7,18 +7,14 @@ import time
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from modified_models.modified_qwen2 import Qwen2ModifiedForCausalLM, Qwen2ModifiedConfig
 import torch
+import matplotlib.pyplot as plt
+from sklearn.decomposition import PCA
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Device:", device)
-# TRESHOLD = 0.8
-# STRENGTH = 50
-TRESHOLD = 0.0
-STRENGTH = 1
-BIAS1 = 1
 
 
-# No future token or selective token yet or handling different number of tokens
 def extract_activations(model, tokenizer, prompts, prompts_labels, activations, n_tok_prompt, n_tok_start, n_tok_stop):
     def hook_inp(model, input, output):
         temp_activations["inp"].append(input[0].detach())
@@ -109,7 +105,8 @@ def extract_activations(model, tokenizer, prompts, prompts_labels, activations, 
         activations_outs.append(activations_outs_prompt)
 
     activations_lengths = [min(gld_length, err_length) for gld_length, err_length in zip(gld_lengths, err_lengths)]
-    
+    print("Activations lengths", activations_lengths)
+
     for prompt_label, activations_inps_prompt, activations_outs_prompt in zip(prompts_labels, activations_inps, activations_outs):
         activations_inps_prompt_reduced = []
         activations_outs_prompt_reduced = []
@@ -137,7 +134,16 @@ def get_collinearities(mat):
     return torch.div(collinearities.T, torch.sum(collinearities, dim=1)).T
 
 
-def modify_layers(model, layer_to_modify, insertion_type, activations):
+def print_ranks(name, m):
+    frobenius_norm_squared = torch.sum(m**2)
+    spectral_norm_squared = torch.max(torch.linalg.svdvals(m))**2
+    rank = torch.linalg.matrix_rank(m).detach().item()
+    stable_rank = (frobenius_norm_squared/spectral_norm_squared).detach().item()
+    print(name, "| Rank:", rank, "| Stable rank:", stable_rank)
+    print("SVD vals:", torch.round(torch.linalg.svdvals(m), decimals=4))
+    return stable_rank
+
+def modify_layers(model, layer_to_modify, insertion_type, activations, strength, treshold):
     err_inp = activations["err"]["inp"].to(device)
     err_out = activations["err"]["out"].to(device)
     gld_inp = activations["gld"]["inp"].to(device)
@@ -155,59 +161,51 @@ def modify_layers(model, layer_to_modify, insertion_type, activations):
 
     print("Vectors dims", err_inp.size(), err_out.size(), err_inp.size(), gld_inp.size(), gld_out.size(), gld_inp.size())
 
-    # x = err_inp
-    # w_up = torch.div(x, (torch.norm(x, dim=2).unsqueeze(-1)**2))
-    # y = gld_out - err_out
-    # z_edit = torch.matmul(x, w_up.permute(0, 2, 1))
-
-    # collinearities = [get_collinearities(z_edit_layer) for z_edit_layer in z_edit]
-    # x = [collinearities_layer@x_layer for collinearities_layer, x_layer in zip(collinearities, x)]
-    # w_up = [collinearities_layer@w_up_layer for collinearities_layer, w_up_layer in zip(collinearities, w_up)]
-    # for layer in range(n_layers):
-    #     print("PARA -----------------------------------------------------------------------" + str(layer))
-    #     for para_inp in para_inps:
-    #         print(para_inp[layer].shape, w_up[layer].T.shape)
-    #         print("z_para", torch.matmul(para_inp[layer], w_up[layer].T))
-    #     print("NEIGHBOOR -----------------------------------------------------------------------" + str(layer))
-    #     for neighboor_inp in neighboor_inps:
-    #         print(neighboor_inp[layer].shape, w_up[layer].T.shape)
-    #         print("z_neighboor", torch.matmul(neighboor_inp[layer], w_up[layer].T))
-
-
     if insertion_type == "all":
-        # not tested yet
+        # not working yet, only use for debug purpose
         x = err_inp
         y = gld_out - err_out
-        w_up = torch.div(x, (torch.norm(x, dim=2).unsqueeze(-1)**2))
-        z_edit = torch.matmul(x, w_up.permute(0, 2, 1))
+        norm_squared_x = torch.div(x, (torch.norm(x, dim=2).unsqueeze(-1)**2))
+        w_up = norm_squared_x/strength
+        w_gate = strength*(norm_squared_x - treshold)
+        norm_edit = torch.matmul(x, norm_squared_x.permute(0, 2, 1))
+        z_edit = norm_edit/strength
+        g_edit = strength*(norm_edit - treshold)
 
-        collinearities = [get_collinearities(z_edit_layer) for z_edit_layer in z_edit]
-        x = [collinearities_layer@x_layer for collinearities_layer, x_layer in zip(collinearities, x)]
-        w_up = [collinearities_layer@w_up_layer for collinearities_layer, w_up_layer in zip(collinearities, w_up)]
-        y = [collinearities_layer@y_layer for collinearities_layer, y_layer in zip(collinearities, y)]
-        z_edit = [collinearities_layer@z_edit_layer@collinearities_layer.T for collinearities_layer, z_edit_layer in zip(collinearities, z_edit)]
-        gated_z_edit = [z_edit_layer*z_edit_layer*torch.nn.functional.sigmoid(z_edit_layer) for z_edit_layer in z_edit]
+        collinearities = [get_collinearities(norm_edit_layer) for norm_edit_layer in norm_edit]
+        x_co = [collinearities_layer@x_layer for collinearities_layer, x_layer in zip(collinearities, x)]
+        w_up_co = [collinearities_layer@w_up_layer for collinearities_layer, w_up_layer in zip(collinearities, w_up)]
+        w_gate_co = [collinearities_layer@w_gate_layer for collinearities_layer, w_gate_layer in zip(collinearities, w_gate)]
+        y_co = [collinearities_layer@y_layer for collinearities_layer, y_layer in zip(collinearities, y)]
+        z_edit_co = [collinearities_layer@z_edit_layer@collinearities_layer.T for collinearities_layer, z_edit_layer in zip(collinearities, z_edit)]
+        g_edit_co = [collinearities_layer@g_edit_layer@collinearities_layer.T for collinearities_layer, g_edit_layer in zip(collinearities, g_edit)]
         
-        w_down = [torch.linalg.solve(gated_z_edit_layer, y_layer).T for gated_z_edit_layer, y_layer in zip(gated_z_edit, y)] + [y[-1].T]
+        # gated_z_edit = [z_edit_layer*z_edit_layer*torch.nn.functional.sigmoid(z_edit_layer) for z_edit_layer in z_edit]
+        # gated_z_edit = [z_edit_layer*z_edit_layer*torch.nn.functional.sigmoid(strength*z_edit_layer) for z_edit_layer in z_edit]
+        gated_z_edit = [z_edit_layer*g_edit_layer*torch.nn.functional.sigmoid(g_edit_layer) for z_edit_layer, g_edit_layer in zip(z_edit, g_edit)]
+        gated_z_edit_co = [z_edit_layer*g_edit_layer*torch.nn.functional.sigmoid(g_edit_layer) for z_edit_layer, g_edit_layer in zip(z_edit_co, g_edit_co)]
+        print("Collinearities", collinearities)
+        print("Gated z edit", gated_z_edit)
+        w_down = [torch.linalg.solve(gated_z_edit_layer, y_layer).T for gated_z_edit_layer, y_layer in zip(gated_z_edit_co, y_co)] + [y_co[-1].T]
+    
     else:
         x = err_inp[layer_to_modify]
         y = gld_out[layer_to_modify] - err_out[layer_to_modify]
         w_up = torch.div(x, (torch.norm(x, dim=1).unsqueeze(-1)**2))
-
         z_edit = torch.matmul(x, w_up.T)
+
         collinearities = get_collinearities(z_edit)
         x = collinearities@x
         w_up = [collinearities@w_up]
         y = collinearities@y
         z_edit = collinearities@z_edit@collinearities.T
 
-        # gated_z_edit = (z_edit + (1 / ((1-TRESHOLD) * torch.nn.functional.sigmoid(torch.tensor(STRENGTH*(1-TRESHOLD))))) - 1)*(z_edit - TRESHOLD)*torch.nn.functional.sigmoid(STRENGTH*(z_edit - TRESHOLD))
-        # gated_z_edit = (z_edit + BIAS1)*(z_edit - TRESHOLD)*torch.nn.functional.sigmoid(STRENGTH*(z_edit - TRESHOLD))
-        # gated_z_edit = z_edit*(z_edit - TRESHOLD)*torch.nn.functional.sigmoid(STRENGTH*(z_edit - TRESHOLD))
-        gated_z_edit = z_edit*z_edit*torch.nn.functional.sigmoid(STRENGTH*z_edit)
+        # gated_z_edit = (z_edit + (1 / ((1-treshold) * torch.nn.functional.sigmoid(torch.tensor(strength*(1-treshold))))) - 1)*(z_edit - treshold)*torch.nn.functional.sigmoid(strength*(z_edit - treshold))
+        # gated_z_edit = (z_edit + BIAS_UP)*(z_edit - treshold)*torch.nn.functional.sigmoid(strength*(z_edit - treshold))
+        gated_z_edit = z_edit*(z_edit - treshold)*torch.nn.functional.sigmoid(strength*(z_edit - treshold))
+        # gated_z_edit = z_edit*z_edit*torch.nn.functional.sigmoid(strength*z_edit)
         print("Collinearities", collinearities)
-        print("Gated z edit", gated_z_edit)
-        
+        print("Gated z edit", gated_z_edit)    
         w_down = [torch.linalg.solve(gated_z_edit, y).T]
         
         print("Condition number", torch.linalg.cond(gated_z_edit))
@@ -216,11 +214,193 @@ def modify_layers(model, layer_to_modify, insertion_type, activations):
 
         print("Norm diff:", torch.norm(torch.matmul(gated_z_edit, w_down[0].T) - y))
 
+
+    # torch.set_printoptions(sci_mode=False)
+    # ranks = {"x": [[],[],[]], "w_up": [[],[],[]], "w_gate": [[],[],[]], "z_edit": [[],[],[]], "g_edit": [[],[],[]], "g_edit_prime": [[],[],[]], "gated_z_edit": [[],[],[]], "w_down": [[],[],[]], "y": [[],[],[]]}
+    # for n,m in model.named_modules():
+    #     if n.endswith(".mlp") or n.endswith(".mlp"):
+    #         layer = int(n.split(".")[2])
+    #         original_w_up = m.up_proj.weight
+    #         original_w_down = m.down_proj.weight
+    #         original_w_gate = m.gate_proj.weight
+    #         print("\n\nLayer", layer, "-------------------------------------------------------------")
+
+    #         print()
+    #         ranks["x"][0].append(print_ranks("x", x[layer]))
+    #         ranks["x"][1].append(print_ranks("x", x[layer]))
+    #         ranks["x"][2].append(print_ranks("x", x[layer]))
+    #         x_pca = PCA(n_components=2).fit_transform(x[layer].cpu().detach().numpy())
+    #         print("pca shape", x_pca.shape)
+    #         plt.scatter(x_pca[:11,0], x_pca[:11,1], label="Edit")
+    #         plt.scatter(x_pca[11:64,0], x_pca[11:64,1], label="Generalisation")
+    #         plt.scatter(x_pca[64:,0], x_pca[64:,1], label="Neighboor")
+    #         plt.title("x")
+    #         plt.legend()
+    #         plt.savefig(f"x_pca_layer_{layer}.png")
+    #         plt.close()
+
+    #         print()
+    #         ranks["w_up"][0].append(print_ranks("w_up", w_up[layer]))
+    #         ranks["w_up"][1].append(print_ranks("original w_up", original_w_up))
+    #         ranks["w_up"][2].append(print_ranks("combined w_up", torch.cat([original_w_up, w_up[layer]]).to(device)))
+
+    #         print()
+    #         ranks["w_gate"][0].append(print_ranks("w_gate", w_gate[layer]))
+    #         ranks["w_gate"][1].append(print_ranks("original w_gate", original_w_gate))
+    #         ranks["w_gate"][2].append(print_ranks("combined w_gate", torch.cat([original_w_gate, w_gate[layer]]).to(device)))
+            
+    #         print()
+    #         original_z_edit = torch.matmul(x[layer], original_w_up.T)
+    #         ranks["z_edit"][0].append(print_ranks("z_edit", z_edit[layer]))
+    #         ranks["z_edit"][1].append(print_ranks("original z_edit", original_z_edit))
+    #         ranks["z_edit"][2].append(print_ranks("combined z_edit", torch.cat([original_z_edit.T, z_edit[layer]]).to(device)))
+    #         z_edit_pca = PCA(n_components=2).fit_transform(z_edit[layer].cpu().detach().numpy())
+    #         print("pca shape", z_edit_pca.shape)
+    #         plt.scatter(z_edit_pca[:11,0], z_edit_pca[:11,1], label="Edit")
+    #         plt.scatter(z_edit_pca[11:64,0], z_edit_pca[11:64,1], label="Generalisation")
+    #         plt.scatter(z_edit_pca[64:,0], z_edit_pca[64:,1], label="Neighboor")
+    #         plt.title("z_edit")
+    #         plt.legend()
+    #         plt.savefig(f"z_edit_pca_layer_{layer}.png")
+    #         plt.close()
+
+    #         print()
+    #         original_g_edit = torch.matmul(x[layer], original_w_gate.T)
+    #         ranks["g_edit"][0].append(print_ranks("g_edit", g_edit[layer]))
+    #         ranks["g_edit"][1].append(print_ranks("original g_edit", original_g_edit))
+    #         ranks["g_edit"][2].append(print_ranks("combined g_edit", torch.cat([original_g_edit.T, g_edit[layer]]).to(device)))
+    #         g_edit_pca = PCA(n_components=2).fit_transform(g_edit[layer].cpu().detach().numpy())
+    #         print("pca shape", g_edit_pca.shape)
+    #         plt.scatter(g_edit_pca[:11,0], g_edit_pca[:11,1], label="Edit")
+    #         plt.scatter(g_edit_pca[11:64,0], g_edit_pca[11:64,1], label="Generalisation")
+    #         plt.scatter(g_edit_pca[64:,0], g_edit_pca[64:,1], label="Neighboor")
+    #         plt.title("g_edit")
+    #         plt.legend()
+    #         plt.savefig(f"g_edit_pca_layer_{layer}.png")
+    #         plt.close()
+
+    #         print()
+    #         original_g_edit_prime = torch.nn.functional.sigmoid(original_g_edit)
+    #         ranks["g_edit_prime"][0].append(print_ranks("g_edit_prime", torch.nn.functional.sigmoid(g_edit[layer])))
+    #         ranks["g_edit_prime"][1].append(print_ranks("original g_edit_prime", original_g_edit_prime))
+    #         ranks["g_edit_prime"][2].append(print_ranks("combined g_edit_prime", torch.cat([original_g_edit_prime.T, torch.nn.functional.sigmoid(g_edit[layer])]).to(device)))
+    #         g_edit_prime_pca = PCA(n_components=2).fit_transform(torch.nn.functional.sigmoid(g_edit[layer]).cpu().detach().numpy())
+    #         print("pca shape", g_edit_prime_pca.shape)
+    #         plt.scatter(g_edit_prime_pca[:11,0], g_edit_prime_pca[:11,1], label="Edit")
+    #         plt.scatter(g_edit_prime_pca[11:64,0], g_edit_prime_pca[11:64,1], label="Generalisation")
+    #         plt.scatter(g_edit_prime_pca[64:,0], g_edit_prime_pca[64:,1], label="Neighboor")
+    #         plt.title("g_edit_prime")
+    #         plt.legend()
+    #         plt.savefig(f"g_edit_prime_pca_layer_{layer}.png")
+    #         plt.close()
+
+    #         print()
+    #         original_gated_z_edit = original_z_edit*original_g_edit_prime
+    #         ranks["gated_z_edit"][0].append(print_ranks("gated_z_edit", gated_z_edit[layer]))
+    #         ranks["gated_z_edit"][1].append(print_ranks("original gated_z_edit", original_gated_z_edit))
+    #         ranks["gated_z_edit"][2].append(print_ranks("combined gated_z_edit", torch.cat([original_gated_z_edit.T, gated_z_edit[layer]]).to(device)))
+    #         gated_z_edit_pca = PCA(n_components=2).fit_transform(gated_z_edit[layer].cpu().detach().numpy())
+    #         print("pca shape", gated_z_edit_pca.shape)
+    #         plt.scatter(gated_z_edit_pca[:11,0], gated_z_edit_pca[:11,1], label="Edit")
+    #         plt.scatter(gated_z_edit_pca[11:64,0], gated_z_edit_pca[11:64,1], label="Generalisation")
+    #         plt.scatter(gated_z_edit_pca[64:,0], gated_z_edit_pca[64:,1], label="Neighboor")
+    #         plt.title("gated_z_edit")
+    #         plt.legend()
+    #         plt.savefig(f"gated_z_edit_pca_layer_{layer}.png")
+    #         plt.close()
+
+    #         print()
+    #         ranks["w_down"][0].append(print_ranks("w_down", w_down[layer]))
+    #         ranks["w_down"][1].append(print_ranks("original w_down", original_w_down))
+    #         ranks["w_down"][2].append(print_ranks("combined w_down", torch.cat([original_w_down, w_down[layer]], dim=1).to(device)))
+
+    #         print()
+    #         original_y = torch.matmul(original_gated_z_edit, original_w_down.T)
+    #         ranks["y"][0].append(print_ranks("y", y[layer]))
+    #         ranks["y"][1].append(print_ranks("original y", original_y))
+    #         ranks["y"][2].append(print_ranks("combined y", original_y + y[layer]))
+    #         y_pca = PCA(n_components=2).fit_transform(y[layer].cpu().detach().numpy())
+    #         print("pca shape", y_pca.shape)
+    #         plt.scatter(y_pca[:11,0], y_pca[:11,1], label="Edit")
+    #         plt.scatter(y_pca[11:64,0], y_pca[11:64,1], label="Generalisation")
+    #         plt.scatter(y_pca[64:,0], y_pca[64:,1], label="Neighboor")
+    #         plt.title("y")
+    #         plt.legend()
+    #         plt.savefig(f"y_pca_layer_{layer}.png")
+    #         plt.close()
+
+    #         if layer == 0:
+    #             plt.imshow(torch.cat([original_w_up, w_up[layer]], dim=0).cpu().detach().numpy(), vmin=w_up[layer].min(), vmax=w_up[layer].max())
+    #             print("w_up", original_w_up.mean(), w_up[layer].mean(), original_w_up.std(), w_up[layer].std())
+    #             plt.colorbar()
+    #             plt.title("w_up")
+    #             plt.savefig("w_up.png")
+    #             plt.close()
+
+    #             plt.imshow(torch.cat([original_w_gate, w_gate[layer]], dim=0).cpu().detach().numpy(), vmin=w_gate[layer].min(), vmax=w_gate[layer].max())
+    #             print("w_gate", original_w_gate.mean(), w_gate[layer].mean(), original_w_gate.std(), w_gate[layer].std())
+    #             plt.colorbar()
+    #             plt.title("w_gate")
+    #             plt.savefig("w_gate.png")
+    #             plt.close()
+
+    #             plt.imshow(torch.cat([original_z_edit.T, z_edit[layer]], dim=0).cpu().detach().numpy(), vmin=z_edit[layer].min(), vmax=z_edit[layer].max())
+    #             print("z_edit", original_z_edit.mean(), z_edit[layer].mean(), original_z_edit.std(), z_edit[layer].std())
+    #             plt.colorbar()
+    #             plt.title("z_edit")
+    #             plt.savefig("z_edit.png")
+    #             plt.close()
+
+    #             plt.imshow(torch.cat([original_g_edit.T, g_edit[layer]], dim=0).cpu().detach().numpy(), vmin=g_edit[layer].min(), vmax=g_edit[layer].max())
+    #             print("g_edit", original_g_edit.mean(), g_edit[layer].mean(), original_g_edit.std(), g_edit[layer].std())
+    #             plt.colorbar()
+    #             plt.title("g_edit")
+    #             plt.savefig("g_edit.png")
+    #             plt.close()
+
+    #             plt.imshow(torch.cat([original_g_edit_prime.T, torch.nn.functional.sigmoid(g_edit[layer])], dim=0).cpu().detach().numpy(), vmin=torch.nn.functional.sigmoid(g_edit[layer])[layer].min(), vmax=torch.nn.functional.sigmoid(g_edit[layer])[layer].max())
+    #             print("g_edit_prime", original_g_edit_prime.mean(), torch.nn.functional.sigmoid(g_edit[layer]).mean(), original_g_edit_prime.std(), torch.nn.functional.sigmoid(g_edit[layer]).std())
+    #             plt.colorbar()
+    #             plt.title("g_edit_prime")
+    #             plt.savefig("g_edit_prime.png")
+    #             plt.close()
+
+    #             plt.imshow(torch.cat([original_gated_z_edit.T, gated_z_edit[layer]], dim=0).cpu().detach().numpy(), vmin=gated_z_edit[layer].min(), vmax=gated_z_edit[layer].max())
+    #             print("gated_z_edit", original_gated_z_edit.mean(), gated_z_edit[layer].mean(), original_gated_z_edit.std(), gated_z_edit[layer].std())
+    #             plt.colorbar()
+    #             plt.title("gated_z_edit")
+    #             plt.savefig("gated_z_edit.png")
+    #             plt.close()
+
+    #             plt.imshow(torch.cat([original_w_down, w_down[layer]], dim=1).cpu().detach().numpy(), vmin=original_w_down.min(), vmax=original_w_down.max())
+    #             print("w_down", original_w_down.mean(), w_down[layer].mean(), original_w_down.std(), w_down[layer].std())
+    #             plt.colorbar()
+    #             plt.title("w_down")
+    #             plt.savefig("w_down.png")
+    #             plt.close()
+
+    #             plt.imshow((original_y + y[layer]).cpu().detach().numpy(), vmin=(original_y + y[layer]).min(), vmax=(original_y + y[layer]).max())
+    #             print("combined_y", (original_y + y[layer]).mean(), (original_y + y[layer]).std())
+    #             plt.colorbar()
+    #             plt.title("combined_y")
+    #             plt.savefig("combined_y.png")
+    #             plt.close()
+
+    # for k, v in ranks.items():
+    #     plt.plot(v[0], label="New")
+    #     plt.plot(v[1], label="Original")
+    #     plt.plot(v[2], label="Combined")
+    #     plt.title(k)
+    #     plt.legend()
+    #     plt.savefig(f"{k}_rank.png")
+    #     plt.close()
+
     for n,m in model.named_modules():
         if n.endswith(".mlp.gate_proj") or n.endswith(".mlp.up_proj"):
             layer = int(n.split(".")[2])
             w = m.weight
             b = m.bias
+
             if layer_to_modify == 0 or insertion_type != "reccursive":
                 w = torch.cat([w, torch.zeros(256, w.size(1)).to(device)])
                 b = torch.zeros(w.size(0)).to(device)
@@ -232,12 +412,14 @@ def modify_layers(model, layer_to_modify, insertion_type, activations):
                     w_up_layer = w_up[0]
                 with torch.no_grad():
                     if n.endswith(".mlp.gate_proj"):
-                        w[-256:-256+w_up_layer.size(0)] = w_up_layer*STRENGTH
-                        # b[-256:-256+w_up_layer.size(0)] = -TRESHOLD*STRENGTH
+                        w[-256:-256+w_up_layer.size(0)] = w_up_layer*strength
+                        # w[-256:-256+w_up_layer.size(0)] = w_up_layer*strength
+                        b[-256:-256+w_up_layer.size(0)] = -treshold*strength
                     else:
-                        w[-256:-256+w_up_layer.size(0)] = w_up_layer*(1/STRENGTH)
-                        # b[-256:-256+w_up_layer.size(0)] = (1/STRENGTH)*((1 / ((1-TRESHOLD) * torch.nn.functional.sigmoid(torch.tensor(STRENGTH*(1-TRESHOLD))))) - 1)
-                        # b[-256:-256+w_up_layer.size(0)] = (1/STRENGTH)*BIAS1
+                        w[-256:-256+w_up_layer.size(0)] = w_up_layer*(1/strength)
+                        # w[-256:-256+w_up_layer.size(0)] = w_up_layer*(1/strength)
+                        # b[-256:-256+w_up_layer.size(0)] = (1/strength)*((1 / ((1-treshold) * torch.nn.functional.sigmoid(torch.tensor(strength*(1-treshold))))) - 1)
+                        # b[-256:-256+w_up_layer.size(0)] = (1/strength)*BIAS_UP
             m.weight = torch.nn.Parameter(w)
             m.bias = torch.nn.Parameter(b)
         elif n.endswith(".mlp.down_proj"):
@@ -262,7 +444,7 @@ def modify_layers(model, layer_to_modify, insertion_type, activations):
 
     return model
 
-def main(model, tokenizer, gld_prompt, err_prompt, n_tok_prompt, n_tok_start, n_tok_stop, insertion_type, layer_to_modify):
+def main(model, tokenizer, gld_prompt, err_prompt, n_tok_prompt, n_tok_start, n_tok_stop, insertion_type, layer_to_modify, strength, treshold):
     prompts = [gld_prompt, err_prompt]
     prompts_labels = ["gld", "err"]
     activations = {"gld": {}, "err": {}}
@@ -273,7 +455,7 @@ def main(model, tokenizer, gld_prompt, err_prompt, n_tok_prompt, n_tok_start, n_
             model = modify_layers(model, i, insertion_type, activations)
             activations = extract_activations(model, tokenizer, [err_prompt], ["err"], activations, n_tok_prompt, n_tok_start, n_tok_stop)
     elif insertion_type == "single" or insertion_type == "all":
-        model = modify_layers(model, layer_to_modify, insertion_type, activations)
+        model = modify_layers(model, layer_to_modify, insertion_type, activations, strength, treshold)
     else:
         raise Exception("Insertion type must be single, reccursive or all")
 
@@ -289,4 +471,6 @@ if __name__ == '__main__':
     n_tok_stop = int(sys.argv[7])
     insertion_type = sys.argv[8]
     layer_to_modify = int(sys.argv[9])
-    main(model, tokenizer, gld_prompt, err_prompt, n_tok_prompt, n_tok_start, n_tok_stop, insertion_type, layer_to_modify)
+    strength = float(sys.argv[10])
+    treshold = float(sys.argv[11])
+    main(model, tokenizer, gld_prompt, err_prompt, n_tok_prompt, n_tok_start, n_tok_stop, insertion_type, layer_to_modify, strength, treshold)

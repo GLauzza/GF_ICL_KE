@@ -44,53 +44,83 @@ def apply_modeledit_to_model(
 def execute_modeledit(model, tok, request, hparams):
     requested_rewrite = request["requested_rewrite"]
 
-    # instruction = "Complete each of the following sentences. "
-    instruction = "Complete in a single sentence. "
     target = requested_rewrite["target_new"]["str"]
     true = requested_rewrite["target_true"]["str"]
 
     prompt = requested_rewrite["prompt"].format(requested_rewrite["subject"])
     if hparams.n_tok_start == -1 or hparams.n_tok_start == -3:
-        n_tok_prompt = [tok(" " + prompt, return_length=True)["length"][0]]
+        n_tok_prompt = [tok(f" {prompt}", return_length=True)["length"][0]]
     else:
         prompt_after_subject = prompt.split(requested_rewrite["subject"])[-1]
         n_tok_prompt = [tok(prompt_after_subject, return_length=True)["length"][0] + 1]
-    err_prompt = [prompt]
 
-
-    if hparams.method == "multi":
-        gld_prompt = [instruction + prompt + " " + target + ". " + prompt]
+    if hparams.method == "multi" or hparams.method == "generalisation":
+        # instruction = "Complete the following{0} sentence"
+        instruction = "Complete in a single sentence."
+        # gld_prompt = [f"{instruction.format(' 2')}s. {prompt} {target}. {prompt}"]
+        gld_prompt = [f"{instruction} {prompt} {target}. {prompt}"]
+        gld_length = tok(gld_prompt[-1], return_length=True)["length"][0]
+        # err_lenght = tok(f"{instruction.format('')}. {prompt}", return_length=True)["length"][0]
+        # err_prompt = [f"{instruction.format('')}. {(gld_length - err_lenght)*'_ '}{prompt}"]
+        err_lenght = tok(f"{instruction} {prompt}", return_length=True)["length"][0]
+        err_prompt = [f"{instruction} {(gld_length - err_lenght)*'_ '}{prompt}"]
 
         for p in request["paraphrase_prompts"]:
-            gld_prompt.append(instruction + p + " " + target + ". " + p)
-            err_prompt.append(p)
+            # gld_prompt.append(f"{instruction.format(' 2')}s. {p} {target}. {p}")
+            gld_prompt.append(f"{instruction} {p} {target}. {p}")
+            gld_length = tok(gld_prompt[-1], return_length=True)["length"][0]
+            # err_lenght = tok(f"{instruction.format('')}. {p}", return_length=True)["length"][0]
+            # err_prompt.append(f"{instruction.format('')}. {(gld_length - err_lenght)*'_ '}{p}")
+            err_lenght = tok(f"{instruction} {p}", return_length=True)["length"][0]
+            err_prompt.append(f"{instruction} {(gld_length - err_lenght)*'_ '}{p}")
             if hparams.n_tok_start == -1 or hparams.n_tok_start == -3:
-                n_tok_prompt.append(tok(" " + p, return_length=True)["length"][0])
+                n_tok_prompt.append(tok(f" {p}", return_length=True)["length"][0])
             else:
                 prompt_after_subject = p.split(requested_rewrite["subject"])[-1]
                 n_tok_prompt.append(tok(prompt_after_subject, return_length=True)["length"][0] + 1)
 
         # We don't have access to subject
-        for p in request["neighborhood_prompts"]:
-            gld_prompt.append(instruction + p + " " + true + ". " + p)
-            err_prompt.append(p)
-            n_tok_prompt.append(tok(" " + p, return_length=True)["length"][0])
+        if hparams.method == "multi":
+            for p in request["neighborhood_prompts"]:
+                # gld_prompt.append(f"{instruction.format(' 2')}s. {p} {true}. {p}")
+                gld_prompt.append(f"{instruction} {p} {true}. {p}")
+                gld_length = tok(gld_prompt[-1], return_length=True)["length"][0]
+                # err_lenght = tok(f"{instruction.format('')}. {p}", return_length=True)["length"][0]
+                # err_prompt.append(f"{instruction.format('')}. {(gld_length - err_lenght)*'_ '}{p}")
+                err_lenght = tok(f"{instruction} {p}", return_length=True)["length"][0]
+                err_prompt.append(f"{instruction} {(gld_length - err_lenght)*'_ '}{p}")
+                n_tok_prompt.append(tok(f" {p}", return_length=True)["length"][0])
 
     else:
-        paraphrase_prompts = "".join([p + " " + target + ". " for p in request["paraphrase_prompts"]])
-        neighborhood_prompts = "".join([p + " " + true + ". " for p in request["neighborhood_prompts"]])
-
-
         if hparams.method == "icl":
-            gld_prompt = [instruction + paraphrase_prompts + neighborhood_prompts + prompt + " " + target + ". " + prompt]
+            # instruction = "Complete the following{0} prompt"
+            instruction = "Complete in a single sentence."
+            n_paraphrase = len(request["paraphrase_prompts"])
+            n_neighborhood = len(request["neighborhood_prompts"])
+            # paraphrase_prompts = "".join([f"New fact: {prompt} {target}.\nPrompt {i+1}: {p} {target}.\n" for i, p in enumerate(request["paraphrase_prompts"])])
+            paraphrase_prompts = "".join([f"{p} {target}. " for i, p in enumerate(request["paraphrase_prompts"])])
+            # neighborhood_prompts = "".join([f"New fact: {prompt} {target}.\nPrompt {i+n_paraphrase+1}: {p} {true}.\n" for i, p in enumerate(request["neighborhood_prompts"])])
+            neighborhood_prompts = "".join([f"{p} {true}. " for i, p in enumerate(request["neighborhood_prompts"])])
+            # gld_prompt = [f"{instruction.format(' ' + str(n_paraphrase+n_neighborhood+1))}s.\n{paraphrase_prompts}{neighborhood_prompts}New fact: {prompt} {target}.\nPrompt {n_paraphrase+n_neighborhood+1}: {prompt}"]
+            # gld_prompt = [f"{instruction}\n{paraphrase_prompts}{neighborhood_prompts}New fact: {prompt} {target}.\nPrompt {n_paraphrase+n_neighborhood+1}: {prompt}"]
+            gld_prompt = [f"{instruction} {paraphrase_prompts} {neighborhood_prompts} {prompt} {target}. {prompt}"]
+            gld_prompt = [f"{instruction} {paraphrase_prompts} {prompt} {target}. {prompt}"]
         elif hparams.method == "classic":
-            gld_prompt = [instruction + prompt + " " + target + ". " + prompt]
+            # instruction = "Complete the following{0} sentence"
+            # gld_prompt = [f"{instruction.format(' 2')}s. {prompt} {target}. {prompt}"]
+            # instruction = "Complete the following sentence"
+            instruction = "Complete in a single sentence."
+            gld_prompt = [f"{instruction} {prompt} {target}. {prompt}"]
         else:
-            raise Exception("Method must be multi, icl or classic")
-        gld_length = tok(gld_prompt, return_length=True)["length"][0]
-        err_lenght = tok(instruction + err_prompt[0], return_length=True)["length"][0]
-        err_prompt = [instruction + (gld_length - err_lenght)*"_ " + err_prompt[0]]
+            raise Exception("Method must be multi, icl, generalisation or classic")
+
+        gld_length = tok(gld_prompt[-1], return_length=True)["length"][0]
+        # err_lenght = tok(f"{instruction.format('')}. {prompt}", return_length=True)["length"][0]
+        # err_prompt = [f"{instruction.format('')}. {(gld_length - err_lenght)*'_ '}{prompt}"]
+        err_lenght = tok(f"{instruction} {prompt}", return_length=True)["length"][0]
+        err_prompt = [f"{instruction} {(gld_length - err_lenght)*'_ '}{prompt}"]
+        print(gld_length, tok(err_prompt[-1], return_length=True)["length"][0])
         
-    model, tokenizer = hfedit.main(deepcopy(model), tok, gld_prompt, err_prompt, n_tok_prompt, hparams.n_tok_start, hparams.n_tok_stop, hparams.insertion_type, hparams.layer_to_modify)
+    model, tokenizer = hfedit.main(deepcopy(model), tok, gld_prompt, err_prompt, n_tok_prompt, hparams.n_tok_start, hparams.n_tok_stop, hparams.insertion_type, hparams.layer_to_modify, hparams.strength, hparams.treshold)
     
     return model, {}

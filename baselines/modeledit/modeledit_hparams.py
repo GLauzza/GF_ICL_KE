@@ -11,3 +11,5 @@ class ModelEditHyperParams(HyperParams):
     n_tok_start: int
     n_tok_stop: int
     method: str
+    strength: float
+    treshold: float
