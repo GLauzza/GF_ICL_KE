@@ -206,6 +206,16 @@ def modify_layers(model, layer_to_modify, insertion_type, activations, strength,
         # gated_z_edit = z_edit*z_edit*torch.nn.functional.sigmoid(strength*z_edit)
         print("Collinearities", collinearities)
         print("Gated z edit", gated_z_edit)    
+        # print("diagonal", torch.diagonal(gated_z_edit))
+        # print("off diagonal min", torch.min(gated_z_edit - 0.01*torch.eye(gated_z_edit.size(0)).to(device)))
+        # print("off diagonal max", torch.max(gated_z_edit - 0.01*torch.eye(gated_z_edit.size(0)).to(device)))
+        # print("size", gated_z_edit.size())
+        # plt.imshow(gated_z_edit.cpu().detach().numpy(), vmin=gated_z_edit.min(), vmax=gated_z_edit.max())
+        # plt.colorbar()
+        # plt.title("gated_z_edit")
+        # plt.savefig("gated_z_edit.png")
+        # plt.close()
+
         w_down = [torch.linalg.solve(gated_z_edit, y).T]
         
         print("Condition number", torch.linalg.cond(gated_z_edit))
