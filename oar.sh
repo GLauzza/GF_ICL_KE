@@ -1,15 +1,15 @@
 #!/bin/bash 
-#OAR -q production
+#OAR -t exotic
+#OAR -p gpu-16GB 
 #OAR -n Evaluate ModelEdit
-#OAR -l host=1/gpu=1, walltime=1
+#OAR -l host=1/gpu=1, walltime=0:10
 #OAR -O ./OAR_logs/OAR_%jobid%.out
 #OAR -E ./OAR_logs/OAR_%jobid%.out
+
 
 export PATH=/home/glauzzana/miniconda3/bin:$PATH
 
 conda activate rome
-
-# python ./gguf_to_hf.py
 
 module load cuda/12.1.1_gcc-10.4.0    
 nvcc --version
@@ -18,9 +18,17 @@ export CUDA_PATH=/grid5000/spack/v1/opt/spack/linux-debian11-x86_64_v2/gcc-10.4.
 module load gcc/10.4.0_gcc-10.4.0
 nvidia-smi
 
-python3 data_aug.py
+cd ./llama.cpp
+# cmake -B build
+cmake -B build -DGGML_CUDA=ON
+cmake --build build --config Release
+cd ..
 
-# python3 -m experiments.evaluate --dataset_size_limit=2 --alg_name="ModelEdit" --model_name="Qwen/Qwen2.5-0.5B" --hparams_fname="Qwen_Qwen2.5-0.5B.json" --skip_generation_tests
+# python ./gguf_to_hf.py
+
+# python3 data_aug.py
+
+python3 -m experiments.evaluate --dataset_size_limit=1 --alg_name="ModelEdit" --model_name="Qwen/Qwen2.5-0.5B" --hparams_fname="Qwen_Qwen2.5-0.5B.json" --skip_generation_tests
 
 # for i in $(seq 641 664) 
 # for i in $(seq 665 688) 

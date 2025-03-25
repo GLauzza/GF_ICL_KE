@@ -175,3 +175,6 @@ gguf_ggml_models
 
 # Plots
 *.png
+
+# Llama.cpp
+llama.cpp/

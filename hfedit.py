@@ -5,10 +5,11 @@ import os
 import time
 
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from modified_models.modified_qwen2 import Qwen2ModifiedForCausalLM, Qwen2ModifiedConfig
+from modified_models.modified_qwen2 import Qwen2ModifiedForCausalLM, Qwen2ModifiedConfig, Qwen2MLP
 import torch
+import numpy as np
 import matplotlib.pyplot as plt
-from sklearn.decomposition import PCA
+from sklearn.decomposition import PCA, TruncatedSVD
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -124,10 +125,16 @@ def extract_activations(model, tokenizer, prompts, prompts_labels, activations, 
     return activations
 
 def get_collinearities(mat):
-    distances = torch.cdist(mat, mat, p=2)
+    distances = torch.cdist(mat, mat, p=2) / torch.sqrt(torch.tensor(mat.size(0)).to(device))
     print("mat", mat)
     print("distances", distances)
-    is_close = torch.where(distances < 0.1, 1., 0.)
+    plt.imshow(distances.cpu().detach().numpy(), vmin=distances.min(), vmax=distances.max())
+    plt.colorbar()
+    plt.title("distances")
+    plt.savefig("distances.png")
+    plt.close()
+    
+    is_close = torch.where(distances < 0.03, 1., 0.)
     is_close_norm = torch.div(is_close, torch.sum(is_close, dim=0)).T
     fused_closeness = torch.where(torch.isclose(torch.cdist(is_close_norm, is_close_norm, p=1), torch.tensor(2.0)), 0., 1.)
     collinearities = torch.flip(torch.unique(fused_closeness, dim=0), dims=(0,))
@@ -135,10 +142,30 @@ def get_collinearities(mat):
 
 
 def print_ranks(name, m):
-    frobenius_norm_squared = torch.sum(m**2)
-    spectral_norm_squared = torch.max(torch.linalg.svdvals(m))**2
     rank = torch.linalg.matrix_rank(m).detach().item()
-    stable_rank = (frobenius_norm_squared/spectral_norm_squared).detach().item()
+
+    # frobenius_norm_squared = torch.sum(m**2)
+    # spectral_norm_squared = torch.max(torch.linalg.svdvals(m))**2
+    # stable_rank = (frobenius_norm_squared/spectral_norm_squared).detach().item()
+
+    # singularvalues = torch.linalg.svdvals(m)
+    # singularvalues = singularvalues ** 2
+    # srank = (torch.sum(singularvalues, dim=-1) / torch.max(singularvalues, dim=-1).values)
+    # stable_rank = srank.mean().item()
+
+    mean_m = m.mean(dim=0)
+    mmT = torch.matmul(m.T, m) / m.size(1) # Outer product averaged over N samples
+    cov_m = mmT - torch.outer(mean_m, mean_m)
+    print("cov and m", cov_m.size(), m.size())
+    print("col", cov_m[895])
+    print("col", cov_m[:,895])
+    S = torch.linalg.svdvals(cov_m[:896, :896])
+
+    # S = torch.linalg.svdvals(m)
+    total_energy = torch.sum(S)
+    cumulative_energy = torch.cumsum(S, dim=0) / total_energy
+    stable_rank = torch.sum(cumulative_energy <= 0.9).item() + 1  # +1 due to zero indexing
+
     print(name, "| Rank:", rank, "| Stable rank:", stable_rank)
     print("SVD vals:", torch.round(torch.linalg.svdvals(m), decimals=4))
     return stable_rank
@@ -149,11 +176,9 @@ def modify_layers(model, layer_to_modify, insertion_type, activations, strength,
     gld_inp = activations["gld"]["inp"].to(device)
     gld_out = activations["gld"]["out"].to(device)
 
-    # para_inps = [read_binaries("./bin_tensors/inp.para" + str(i)) for i in range(1, 3)]
-    # neighboor_inps = [read_binaries("./bin_tensors/inp.neighboor" + str(i)) for i in range(1, 11)]
-
     n_layers = err_inp.size(0)
     n_tok = min(err_inp.size(1), gld_inp.size(1))
+    d_model = err_inp.size(2)
     err_inp = err_inp[:,:n_tok]
     err_out = err_out[:,:n_tok]
     gld_inp = gld_inp[:,:n_tok]
@@ -165,7 +190,10 @@ def modify_layers(model, layer_to_modify, insertion_type, activations, strength,
         # not working yet, only use for debug purpose
         x = err_inp
         y = gld_out - err_out
+        # wn = torch.tensor([m.weight for n,m in model.named_modules() if n.endswith(".post_attention_layernorm")]).to(device)
+        # print("wn", wn.size(), x.size())
         norm_squared_x = torch.div(x, (torch.norm(x, dim=2).unsqueeze(-1)**2))
+        # norm_squared_x = torch.div(x, wn.unsqueeze(1)**2)/wn.size(0)
         w_up = norm_squared_x/strength
         w_gate = strength*(norm_squared_x - treshold)
         norm_edit = torch.matmul(x, norm_squared_x.permute(0, 2, 1))
@@ -188,35 +216,143 @@ def modify_layers(model, layer_to_modify, insertion_type, activations, strength,
         print("Gated z edit", gated_z_edit)
         w_down = [torch.linalg.solve(gated_z_edit_layer, y_layer).T for gated_z_edit_layer, y_layer in zip(gated_z_edit_co, y_co)] + [y_co[-1].T]
     
+        n_new_vecs = torch.max([256 * ((gated_z_edit_layer.size(0)+255)//256) for gated_z_edit_layer in gated_z_edit])
     else:
+        for n,m in model.named_modules():
+            if n.endswith(".post_attention_layernorm") and int(n.split(".")[2]) == layer_to_modify:
+                wn = m.weight
+                break
+
         x = err_inp[layer_to_modify]
         y = gld_out[layer_to_modify] - err_out[layer_to_modify]
+
         w_up = torch.div(x, (torch.norm(x, dim=1).unsqueeze(-1)**2))
+        # w_up = x
+
+        plt.imshow(x.cpu().detach().numpy(), vmin=x.min(), vmax=x.max())
+        plt.colorbar()
+        plt.title("x")
+        plt.savefig("x.png")
+        plt.close()
+
+        plt.imshow(y.cpu().detach().numpy(), vmin=y.min(), vmax=y.max())
+        plt.colorbar()
+        plt.title("y")
+        plt.savefig("y.png")
+        plt.close()
+
+        plt.imshow(w_up.cpu().detach().numpy(), vmin=w_up.min(), vmax=w_up.max())
+        plt.colorbar()
+        plt.title("w_up")
+        plt.savefig("w_up.png")
+        plt.close()
+
+        # # Get principal components
+        # u, s, vt = torch.linalg.svd(x)
+        # uk = u[:]
+        # x = torch.matmul(uk, x)
+        # y = torch.matmul(uk, y)
+        # w_up = torch.matmul(uk, w_up)
+        # w_up = torch.div(x, (torch.norm(x, dim=1).unsqueeze(-1)**2))
+
+        # svd = TruncatedSVD(n_components=x.size(0) - 1, algorithm="arpack")
+        # x = torch.tensor(svd.fit_transform(x.T.cpu())).to(device).T
+        # y = torch.tensor(svd.transform(y.T.cpu())).to(device).T
+        # w_up = torch.tensor(svd.transform(w_up.T.cpu())).to(device).T
+        # w_up = torch.div(x, (torch.norm(x, dim=1).unsqueeze(-1)**2))
+        # w_up = torch.div(x, (torch.norm(x, dim=1).unsqueeze(-1)**2))
+
+        # w_up = torch.div(x, wn.unsqueeze(0)**2)/wn.size(0)
+
+        # w_up = torch.div(x, (torch.norm(x, dim=1).unsqueeze(-1)))
+        # w_up = torch.div(w_up, wn.unsqueeze(0))/torch.sqrt(torch.tensor(wn.size(0)).to(device))
+
+        # x_norm = torch.norm(x, dim=1).unsqueeze(-1)
+        # w_up = torch.div(x, wn.unsqueeze(0))/torch.sqrt(torch.tensor(wn.size(0)).to(device))
+        # w_up = torch.div(w_up, x_norm)
+
         z_edit = torch.matmul(x, w_up.T)
+        # gated_z_edit = z_edit*(z_edit - treshold)*torch.nn.functional.sigmoid(strength*(z_edit - treshold))
+        print("Z edit before collinearities", z_edit)    
+        print("diagonal", torch.diagonal(z_edit))
+        print("off diagonal min", torch.min(z_edit - 0.01*torch.eye(z_edit.size(0)).to(device)))
+        print("off diagonal max", torch.max(z_edit - 0.01*torch.eye(z_edit.size(0)).to(device)))
+        plt.imshow(z_edit.cpu().detach().numpy(), vmin=z_edit.min(), vmax=z_edit.max())
+        plt.colorbar()
+        plt.title("z_edit_pre")
+        plt.savefig("z_edit_pre.png")
+        plt.close()
 
-        collinearities = get_collinearities(z_edit)
-        x = collinearities@x
-        w_up = [collinearities@w_up]
-        y = collinearities@y
-        z_edit = collinearities@z_edit@collinearities.T
+        # # collinearities = get_collinearities(gated_z_edit)
+        # collinearities = get_collinearities(z_edit)
+        # x = collinearities@x
+        # w_up = [collinearities@w_up]
+        # y = collinearities@y
+        # z_edit = collinearities@z_edit@collinearities.T
 
+        # u, s, vt = torch.linalg.svd(z_edit)
+        # uk = u[:30]
+        # x = uk@x
+        # w_up = [uk@w_up]
+        # y = uk@y
+        # z_edit = uk@z_edit@uk.T
+
+        eigval, eigvec = torch.linalg.eigh(z_edit)
+        qk = eigvec[:]
+        x = qk@x
+        w_up = [qk@w_up]
+        y = qk@y
+        z_edit = qk@z_edit@qk.T
+
+
+        gated_z_edit = z_edit*(z_edit - treshold)*torch.nn.functional.sigmoid(strength*(z_edit - treshold))
         # gated_z_edit = (z_edit + (1 / ((1-treshold) * torch.nn.functional.sigmoid(torch.tensor(strength*(1-treshold))))) - 1)*(z_edit - treshold)*torch.nn.functional.sigmoid(strength*(z_edit - treshold))
         # gated_z_edit = (z_edit + BIAS_UP)*(z_edit - treshold)*torch.nn.functional.sigmoid(strength*(z_edit - treshold))
-        gated_z_edit = z_edit*(z_edit - treshold)*torch.nn.functional.sigmoid(strength*(z_edit - treshold))
-        # gated_z_edit = z_edit*z_edit*torch.nn.functional.sigmoid(strength*z_edit)
-        print("Collinearities", collinearities)
+        print("Z edit", z_edit)    
+        print("diagonal", torch.diagonal(z_edit))
+        print("off diagonal min", torch.min(z_edit - 0.01*torch.eye(z_edit.size(0)).to(device)))
+        print("off diagonal max", torch.max(z_edit - 0.01*torch.eye(z_edit.size(0)).to(device)))
+
+        # print("Collinearities", collinearities)
         print("Gated z edit", gated_z_edit)    
-        # print("diagonal", torch.diagonal(gated_z_edit))
-        # print("off diagonal min", torch.min(gated_z_edit - 0.01*torch.eye(gated_z_edit.size(0)).to(device)))
-        # print("off diagonal max", torch.max(gated_z_edit - 0.01*torch.eye(gated_z_edit.size(0)).to(device)))
-        # print("size", gated_z_edit.size())
-        # plt.imshow(gated_z_edit.cpu().detach().numpy(), vmin=gated_z_edit.min(), vmax=gated_z_edit.max())
-        # plt.colorbar()
-        # plt.title("gated_z_edit")
-        # plt.savefig("gated_z_edit.png")
-        # plt.close()
+        print("diagonal", torch.diagonal(gated_z_edit))
+        print("off diagonal min", torch.min(gated_z_edit - 0.01*torch.eye(gated_z_edit.size(0)).to(device)))
+        print("off diagonal max", torch.max(gated_z_edit - 0.01*torch.eye(gated_z_edit.size(0)).to(device)))
+        print("size", gated_z_edit.size())
+        plt.imshow(gated_z_edit.cpu().detach().numpy(), vmin=gated_z_edit.min(), vmax=gated_z_edit.max())
+        plt.colorbar()
+        plt.title("gated_z_edit")
+        plt.savefig("gated_z_edit.png")
+        plt.close()
+
+        plt.imshow(z_edit.cpu().detach().numpy(), vmin=z_edit.min(), vmax=z_edit.max())
+        plt.colorbar()
+        plt.title("z_edit")
+        plt.savefig("z_edit.png")
+        plt.close()
+
+        plt.imshow(x.cpu().detach().numpy(), vmin=x.min(), vmax=x.max())
+        plt.colorbar()
+        plt.title("x_post")
+        plt.savefig("x_post.png")
+        plt.close()
+
+        plt.imshow(y.cpu().detach().numpy(), vmin=y.min(), vmax=y.max())
+        plt.colorbar()
+        plt.title("y_post")
+        plt.savefig("y_post.png")
+        plt.close()
+
+        plt.imshow(w_up[0].cpu().detach().numpy(), vmin=w_up[0].min(), vmax=w_up[0].max())
+        plt.colorbar()
+        plt.title("w_up_post")
+        plt.savefig("w_up_post.png")
+        plt.close()
+
 
         w_down = [torch.linalg.solve(gated_z_edit, y).T]
+
+        n_new_vecs = 256 * ((gated_z_edit.size(0)+255)//256)
         
         print("Condition number", torch.linalg.cond(gated_z_edit))
         if torch.linalg.cond(gated_z_edit) > 10:
@@ -412,9 +548,9 @@ def modify_layers(model, layer_to_modify, insertion_type, activations, strength,
             b = m.bias
 
             if layer_to_modify == 0 or insertion_type != "reccursive":
-                w = torch.cat([w, torch.zeros(256, w.size(1)).to(device)])
+                w = torch.cat([w, torch.zeros(n_new_vecs, w.size(1)).to(device)])
                 b = torch.zeros(w.size(0)).to(device)
-                m.in_features += 256
+                m.in_features += n_new_vecs
             if layer == layer_to_modify or insertion_type == "all":
                 if insertion_type == "all":
                     w_up_layer = w_up[layer]
@@ -422,22 +558,22 @@ def modify_layers(model, layer_to_modify, insertion_type, activations, strength,
                     w_up_layer = w_up[0]
                 with torch.no_grad():
                     if n.endswith(".mlp.gate_proj"):
-                        w[-256:-256+w_up_layer.size(0)] = w_up_layer*strength
-                        # w[-256:-256+w_up_layer.size(0)] = w_up_layer*strength
-                        b[-256:-256+w_up_layer.size(0)] = -treshold*strength
+                        w[-n_new_vecs:-n_new_vecs+w_up_layer.size(0)] = w_up_layer*strength
+                        # w[-n_new_vecs:-n_new_vecs+w_up_layer.size(0)] = w_up_layer*strength
+                        b[-n_new_vecs:-n_new_vecs+w_up_layer.size(0)] = -treshold*strength
                     else:
-                        w[-256:-256+w_up_layer.size(0)] = w_up_layer*(1/strength)
-                        # w[-256:-256+w_up_layer.size(0)] = w_up_layer*(1/strength)
-                        # b[-256:-256+w_up_layer.size(0)] = (1/strength)*((1 / ((1-treshold) * torch.nn.functional.sigmoid(torch.tensor(strength*(1-treshold))))) - 1)
-                        # b[-256:-256+w_up_layer.size(0)] = (1/strength)*BIAS_UP
+                        w[-n_new_vecs:-n_new_vecs+w_up_layer.size(0)] = w_up_layer*(1/strength)
+                        # w[-n_new_vecs:-n_new_vecs+w_up_layer.size(0)] = w_up_layer*(1/strength)
+                        # b[-n_new_vecs:-n_new_vecs+w_up_layer.size(0)] = (1/strength)*((1 / ((1-treshold) * torch.nn.functional.sigmoid(torch.tensor(strength*(1-treshold))))) - 1)
+                        # b[-n_new_vecs:-n_new_vecs+w_up_layer.size(0)] = (1/strength)*BIAS_UP
             m.weight = torch.nn.Parameter(w)
             m.bias = torch.nn.Parameter(b)
         elif n.endswith(".mlp.down_proj"):
             layer = int(n.split(".")[2])
             w = m.weight
             if layer_to_modify == 0 or insertion_type != "reccursive":
-                w = torch.cat([w,  torch.zeros(w.size(0), 256).to(device)], dim=1)
-                m.out_features += 256
+                w = torch.cat([w,  torch.zeros(w.size(0), n_new_vecs).to(device)], dim=1)
+                m.out_features += n_new_vecs
             if layer == layer_to_modify or insertion_type == "all":
                 print("Modifying layer ", layer)
                 if insertion_type == "all":
@@ -445,12 +581,12 @@ def modify_layers(model, layer_to_modify, insertion_type, activations, strength,
                 else:
                     w_down_layer = w_down[0]
                 with torch.no_grad():
-                    w[:,-256:-256+w_down_layer.size(1)] = w_down_layer
+                    w[:,-n_new_vecs:-n_new_vecs+w_down_layer.size(1)] = w_down_layer
             m.weight = torch.nn.Parameter(w)
             # print(n, m.weight.size())
 
     if layer_to_modify == 0 or insertion_type!="reccursive":
-        model.config.intermediate_size = model.config.intermediate_size + 256
+        model.config.intermediate_size = model.config.intermediate_size + n_new_vecs
 
     return model
 

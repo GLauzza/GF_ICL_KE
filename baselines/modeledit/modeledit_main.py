@@ -47,6 +47,9 @@ def execute_modeledit(model, tok, request, hparams):
     target = requested_rewrite["target_new"]["str"]
     true = requested_rewrite["target_true"]["str"]
 
+    request["paraphrase_prompts_aug"] = request["paraphrase_prompts_aug"][:10]
+    request["neighborhood_prompts_aug"] = request["neighborhood_prompts_aug"][:10]
+
     prompt = requested_rewrite["prompt"].format(requested_rewrite["subject"])
     if hparams.n_tok_start == -1 or hparams.n_tok_start == -3:
         n_tok_prompt = [tok(f" {prompt}", return_length=True)["length"][0]]
@@ -65,7 +68,7 @@ def execute_modeledit(model, tok, request, hparams):
         err_lenght = tok(f"{instruction} {prompt}", return_length=True)["length"][0]
         err_prompt = [f"{instruction} {(gld_length - err_lenght)*'_ '}{prompt}"]
 
-        for p in request["paraphrase_prompts"]:
+        for p in request["paraphrase_prompts_aug"]:
             # gld_prompt.append(f"{instruction.format(' 2')}s. {p} {target}. {p}")
             gld_prompt.append(f"{instruction} {p} {target}. {p}")
             gld_length = tok(gld_prompt[-1], return_length=True)["length"][0]
@@ -81,7 +84,7 @@ def execute_modeledit(model, tok, request, hparams):
 
         # We don't have access to subject
         if hparams.method == "multi":
-            for p in request["neighborhood_prompts"]:
+            for p in request["neighborhood_prompts_aug"]:
                 # gld_prompt.append(f"{instruction.format(' 2')}s. {p} {true}. {p}")
                 gld_prompt.append(f"{instruction} {p} {true}. {p}")
                 gld_length = tok(gld_prompt[-1], return_length=True)["length"][0]
@@ -95,12 +98,12 @@ def execute_modeledit(model, tok, request, hparams):
         if hparams.method == "icl":
             # instruction = "Complete the following{0} prompt"
             instruction = "Complete in a single sentence."
-            n_paraphrase = len(request["paraphrase_prompts"])
-            n_neighborhood = len(request["neighborhood_prompts"])
+            n_paraphrase = len(request["paraphrase_prompts_aug"])
+            n_neighborhood = len(request["neighborhood_prompts_aug"])
             # paraphrase_prompts = "".join([f"New fact: {prompt} {target}.\nPrompt {i+1}: {p} {target}.\n" for i, p in enumerate(request["paraphrase_prompts"])])
-            paraphrase_prompts = "".join([f"{p} {target}. " for i, p in enumerate(request["paraphrase_prompts"])])
+            paraphrase_prompts = "".join([f"{p} {target}. " for i, p in enumerate(request["paraphrase_prompts_aug"])])
             # neighborhood_prompts = "".join([f"New fact: {prompt} {target}.\nPrompt {i+n_paraphrase+1}: {p} {true}.\n" for i, p in enumerate(request["neighborhood_prompts"])])
-            neighborhood_prompts = "".join([f"{p} {true}. " for i, p in enumerate(request["neighborhood_prompts"])])
+            neighborhood_prompts = "".join([f"{p} {true}. " for i, p in enumerate(request["neighborhood_prompts_aug"])])
             # gld_prompt = [f"{instruction.format(' ' + str(n_paraphrase+n_neighborhood+1))}s.\n{paraphrase_prompts}{neighborhood_prompts}New fact: {prompt} {target}.\nPrompt {n_paraphrase+n_neighborhood+1}: {prompt}"]
             # gld_prompt = [f"{instruction}\n{paraphrase_prompts}{neighborhood_prompts}New fact: {prompt} {target}.\nPrompt {n_paraphrase+n_neighborhood+1}: {prompt}"]
             gld_prompt = [f"{instruction} {paraphrase_prompts} {neighborhood_prompts} {prompt} {target}. {prompt}"]
