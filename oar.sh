@@ -1,6 +1,5 @@
 #!/bin/bash 
-#OAR -t exotic
-#OAR -p gpu-16GB 
+#OAR -p gpu-24GB 
 #OAR -n Evaluate ModelEdit
 #OAR -l host=1/gpu=1, walltime=0:10
 #OAR -O ./OAR_logs/OAR_%jobid%.out
