@@ -47,8 +47,8 @@ def execute_modeledit(model, tok, request, hparams):
     target = requested_rewrite["target_new"]["str"]
     true = requested_rewrite["target_true"]["str"]
 
-    request["paraphrase_prompts_aug"] = request["paraphrase_prompts_aug"][:50]
-    request["neighborhood_prompts_aug"] = request["neighborhood_prompts_aug"][:50]
+    request["paraphrase_prompts_aug"] = request["paraphrase_prompts_aug"][:0]
+    request["neighborhood_prompts_aug"] = request["neighborhood_prompts_aug"][:0]
 
     prompt = requested_rewrite["prompt"].format(requested_rewrite["subject"])
     if hparams.n_tok_start == -1 or hparams.n_tok_start == -3:
