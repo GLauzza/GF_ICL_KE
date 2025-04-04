@@ -17,11 +17,11 @@ export CUDA_PATH=/grid5000/spack/v1/opt/spack/linux-debian11-x86_64_v2/gcc-10.4.
 module load gcc/10.4.0_gcc-10.4.0
 nvidia-smi
 
-cd ./llama.cpp
-# cmake -B build
-cmake -B build -DGGML_CUDA=ON
-cmake --build build --config Release
-cd ..
+# cd ./llama.cpp
+# # cmake -B build
+# cmake -B build -DGGML_CUDA=ON
+# cmake --build build --config Release
+# cd ..
 
 # python ./gguf_to_hf.py
 

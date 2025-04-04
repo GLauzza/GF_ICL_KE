@@ -1,8 +1,8 @@
 {
   "insertion_type": "reccursive",
-  "layer_to_modify": 23,
+  "layer_to_modify": 10,
   "n_tok_start": -1,
-  "n_tok_stop": 0,
+  "n_tok_stop": -1,
   "method": "multi",
   "strength": 1.0,
   "treshold": 0.0

@@ -370,20 +370,23 @@ def modify_layers(model, layer_to_modify, insertion_type, activations, strength,
 
     # y[313:] = torch.zeros((223, 896)).to(device)
         
-    n_new_vecs = 256
+    n_new_vecs = 2048
     config = Qwen2ModifiedConfig(
         hidden_act="silu",
         hidden_size=896,
-        intermediate_size=10
+        intermediate_size=1249
+        # intermediate_size=271
     )
     edit_mlp = Qwen2MLP(config).to(device)
-    optimizer = torch.optim.Adam(edit_mlp.parameters(), lr=1e-3)
+    optimizer = torch.optim.Adam(edit_mlp.parameters(), lr=3e-5)
     loss_fn = torch.nn.MSELoss()
     
     dataset = TensorDataset(x, y)
-    train_loader = DataLoader(dataset, batch_size=1, shuffle=True)
+    train_loader = DataLoader(dataset, batch_size=128, shuffle=True)
+    best_model = edit_mlp
+    best_loss = 10000000000
 
-    epochs = 200
+    epochs = 1000
     for epoch in range(epochs):
         edit_mlp.train()
 
@@ -402,16 +405,22 @@ def modify_layers(model, layer_to_modify, insertion_type, activations, strength,
 
         avg_loss = running_loss / len(train_loader)
 
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            best_model_state_dict = edit_mlp.state_dict()   
+
         if epoch % 5 == 0:
             print(f"Epoch {epoch}/{epochs}, Loss: {avg_loss}")
 
-    edit_mlp.eval()
+    best_model = Qwen2MLP(config).to(device)
+    best_model.load_state_dict(best_model_state_dict)
+    best_model.eval()
 
-    w_up = [edit_mlp.up_proj.weight]
-    w_gate = [edit_mlp.gate_proj.weight]
-    w_down = [edit_mlp.down_proj.weight]
-    w_up_bias = edit_mlp.up_proj.bias
-    w_gate_bias = edit_mlp.gate_proj.bias
+    w_up = [best_model.up_proj.weight]
+    w_gate = [best_model.gate_proj.weight]
+    w_down = [best_model.down_proj.weight]
+    w_up_bias = best_model.up_proj.bias
+    w_gate_bias = best_model.gate_proj.bias
     print(w_up[0].size(), w_gate[0].size(), w_down[0].size(), w_up_bias.size(), w_gate_bias.size())
 
 
