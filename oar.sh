@@ -1,7 +1,7 @@
 #!/bin/bash 
 #OAR -p gpu-24GB 
 #OAR -n Evaluate ModelEdit
-#OAR -l host=1/gpu=1, walltime=0:10
+#OAR -l host=1/gpu=1, walltime=1
 #OAR -O ./OAR_logs/OAR_%jobid%.out
 #OAR -E ./OAR_logs/OAR_%jobid%.out
 

@@ -65,7 +65,9 @@ def filter_responses(responses, answer, subject, n, prompt, tokenizer, model, fi
             (subject in response) == subject_in_response
         ):
             filtered_response = "".join(response.split(":")[1:])[:-len(f" {answer}.")].strip()
-            if filtered_response not in filtered_responses:
+            print(filtered_response)
+            print(answer not in filtered_response)
+            if (filtered_response not in filtered_responses) and (answer not in filtered_response):
                 filtered_responses.append(filtered_response)
                 if len(filtered_responses) == n:
                     return filtered_responses
@@ -111,7 +113,7 @@ def main():
             f"of the following sentence: {edit} {target}."
         )
         paraphrases = get_responses(prompt_paraphrase, tokenizer, model)
-        filtered_paraphrases = filter_responses(paraphrases, target, subject, 50, prompt_paraphrase, tokenizer, model, [], subject_in_response=True)
+        filtered_paraphrases = filter_responses(paraphrases, target, subject, 100, prompt_paraphrase, tokenizer, model, [], subject_in_response=True)
         print(filtered_paraphrases)
 
         # prompt_neighborhood = (
@@ -135,7 +137,7 @@ def main():
             f"Original sentence: {edit} {true}."
         )
         neighborhoods = get_responses(prompt_neighborhood, tokenizer, model)
-        filtered_neighborhoods = filter_responses(neighborhoods, true, subject, 50, prompt_neighborhood, tokenizer, model, [], subject_in_response=False)
+        filtered_neighborhoods = filter_responses(neighborhoods, true, subject, 100, prompt_neighborhood, tokenizer, model, [], subject_in_response=False)
         print(filtered_neighborhoods)
 
         data[i]["paraphrase_prompts_aug"] = filtered_paraphrases
@@ -143,7 +145,7 @@ def main():
         with open(dataset_aug_path, "w") as f:
             print("Writing to file")
             json.dump(data, f, indent=2)
-        if i==2:
+        if i==1:
             break
 
 

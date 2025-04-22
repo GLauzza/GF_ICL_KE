@@ -34,11 +34,6 @@ def extract_activations(model, tokenizer, prompts, prompts_labels, activations, 
         elif n.endswith(".post_attention_layernorm"):
             handles.append(m.register_forward_hook(hook_residual))
 
-
-    activations_inps = []
-    activations_outs = []
-    gld_lengths = []
-    err_lengths = []
     for i, (prompt_label, prompt) in enumerate(zip(prompts_labels, prompts)):
         inputs = tokenizer(prompt, return_tensors="pt", return_attention_mask=True, padding=True).to(device)
 
@@ -72,18 +67,23 @@ def extract_activations(model, tokenizer, prompts, prompts_labels, activations, 
                 attention_mask = torch.stack(new_attention_mask, dim=0)
                 if n_ended == input_ids.size(0):
                     break
+            attention_mask[:,-1] = torch.zeros((input_ids.size(0))).to(device)
 
         for k, v in temp_activations.items():
             temp_activations[k] = torch.stack(v, dim=0)
 
-        activations_inps_prompt = []
-        activations_outs_prompt = []
+        activations[prompt_label]["inp"] = []
+        activations[prompt_label]["out"] = []
+        activations[prompt_label]["len"] = []
         for j in range(input_ids.size(0)):
             length_prompt = torch.min(torch.argwhere(torch.cat([torch.logical_not(inputs["attention_mask"][j]), torch.tensor(True).to(device).unsqueeze(-1)])))
             length_prediction = torch.min(torch.argwhere(torch.cat([torch.logical_not(attention_mask[j]), torch.tensor(True).to(device).unsqueeze(-1)])))
             if n_tok_start == n_tok_stop:
-                n_tok_activation_start = length_prompt - n_tok_prompt[j]
-                if n_tok_stop == -1 or n_tok_stop == -2:
+                if n_tok_stop == -6:
+                    n_tok_activation_start = length_prompt - 1
+                else:
+                    n_tok_activation_start = length_prompt - n_tok_prompt[j]
+                if n_tok_stop == -1 or n_tok_stop == -2 or n_tok_stop == -6:
                     n_tok_activation_stop = length_prediction
                 elif n_tok_stop == -3 or n_tok_stop == -4:
                     n_tok_activation_stop = length_prompt
@@ -94,37 +94,17 @@ def extract_activations(model, tokenizer, prompts, prompts_labels, activations, 
                 n_tok_activation_stop = length_prompt + n_tok_stop
             if prompt_label == "gld":
                 print("Gold prompt:", tokenizer.decode(input_ids[j,:length_prediction]))
-                gld_lengths.append(n_tok_activation_stop - n_tok_activation_start)
             else:
                 print("Err prompt:", tokenizer.decode(input_ids[j, :length_prediction]))
-                err_lengths.append(n_tok_activation_stop - n_tok_activation_start)
             print("Editing:", tokenizer.decode(input_ids[j,n_tok_activation_start:n_tok_activation_stop]))
             
-            activations_inps_prompt.append(temp_activations["inp"][:,j,n_tok_activation_start:n_tok_activation_stop])
-            activations_outs_prompt.append(temp_activations["out"][:,j,n_tok_activation_start:n_tok_activation_stop] + temp_activations["residual"][:,j,n_tok_activation_start:n_tok_activation_stop])
-        
-        activations_inps.append(activations_inps_prompt)
-        activations_outs.append(activations_outs_prompt)
+            activations[prompt_label]["inp"].append(temp_activations["inp"][:,j,n_tok_activation_start:n_tok_activation_stop])
+            activations[prompt_label]["out"].append(temp_activations["out"][:,j,n_tok_activation_start:n_tok_activation_stop] + temp_activations["residual"][:,j,n_tok_activation_start:n_tok_activation_stop])
+            activations[prompt_label]["len"].append((n_tok_activation_stop - n_tok_activation_start).cpu())
 
-    if gld_lengths == []:
-        activations_lengths = err_lengths
-    else:
-        activations_lengths = [min(gld_length, err_length) for gld_length, err_length in zip(gld_lengths, err_lengths)]
-        
-    print("Activations lengths", activations_lengths)
-    print("Generalisation activations length", sum(activations_lengths[1:(len(activations_lengths)-1)//2 + 1]))
-    print("Neighboor activations length", sum(activations_lengths[(len(activations_lengths)-1)//2 + 1:]))
-
-    for prompt_label, activations_inps_prompt, activations_outs_prompt in zip(prompts_labels, activations_inps, activations_outs):
-        activations_inps_prompt_reduced = []
-        activations_outs_prompt_reduced = []
-
-        for activations_length, activations_inp, activations_out in zip(activations_lengths, activations_inps_prompt, activations_outs_prompt):
-            activations_inps_prompt_reduced.append(activations_inp[:,:activations_length])
-            activations_outs_prompt_reduced.append(activations_out[:,:activations_length])
-
-        activations[prompt_label]["inp"] = torch.cat(activations_inps_prompt_reduced, dim=1)
-        activations[prompt_label]["out"] = torch.cat(activations_outs_prompt_reduced, dim=1)
+    for prompt_label in prompts_labels:
+        activations[prompt_label]["inp"] = torch.cat(activations[prompt_label]["inp"], dim=1)
+        activations[prompt_label]["out"] = torch.cat(activations[prompt_label]["out"], dim=1)
 
     for handle in handles:
         handle.remove()
@@ -178,18 +158,31 @@ def print_ranks(name, m):
     return stable_rank
 
 def modify_layers(model, layer_to_modify, insertion_type, activations, strength, treshold):
-    err_inp = activations["err"]["inp"].to(device)
-    err_out = activations["err"]["out"].to(device)
-    gld_inp = activations["gld"]["inp"].to(device)
-    gld_out = activations["gld"]["out"].to(device)
+    activations_lengths = [min(gld_length, err_length) for gld_length, err_length in zip(activations["gld"]["len"], activations["err"]["len"])]
+    print("Activations lengths", activations_lengths)
+    print("Generalisation activations length", sum(activations_lengths[1:(len(activations_lengths)-1)//2 + 1]))
+    print("Neighboor activations length", sum(activations_lengths[(len(activations_lengths)-1)//2 + 1:]))
+
+    print("Activations cumsum", np.cumsum(activations_lengths))
+    err_indices = np.concatenate([[0], np.cumsum(activations["err"]["len"])[:-1]])
+    gld_indices = np.concatenate([[0], np.cumsum(activations["gld"]["len"])[:-1]])
+
+    err_mask = torch.zeros(activations["err"]["inp"].size(1)).to(torch.bool)
+    for start, stop in zip(err_indices, err_indices + activations_lengths):
+        err_mask[start:stop] = True
+    gld_mask = torch.zeros(activations["gld"]["inp"].size(1)).to(torch.bool)
+    for start, stop in zip(gld_indices, gld_indices + activations_lengths):
+        gld_mask[start:stop] = True
+
+    err_inp = activations["err"]["inp"][:, err_mask].to(device)
+    err_out = activations["err"]["out"][:, err_mask].to(device)
+    gld_inp = activations["gld"]["inp"][:, gld_mask].to(device)
+    gld_out = activations["gld"]["out"][:, gld_mask].to(device)
+
 
     n_layers = err_inp.size(0)
     n_tok = min(err_inp.size(1), gld_inp.size(1))
     d_model = err_inp.size(2)
-    err_inp = err_inp[:,:n_tok]
-    err_out = err_out[:,:n_tok]
-    gld_inp = gld_inp[:,:n_tok]
-    gld_out = gld_out[:,:n_tok]
 
     print("Vectors dims", err_inp.size(), err_out.size(), err_inp.size(), gld_inp.size(), gld_out.size(), gld_inp.size())
 
@@ -222,6 +215,7 @@ def modify_layers(model, layer_to_modify, insertion_type, activations, strength,
     #     print("Collinearities", collinearities)
     #     print("Gated z edit", gated_z_edit)
     #     w_down = [torch.linalg.solve(gated_z_edit_layer, y_layer).T for gated_z_edit_layer, y_layer in zip(gated_z_edit_co, y_co)] + [y_co[-1].T]
+    #     w_down = [torch.linalg.solve(gated_z_edit_layer, y_layer).T for gated_z_edit_layer, y_layer in zip(gated_z_edit_co, y_co)] + [y_co[-1].T]
     
     #     n_new_vecs = torch.max([256 * ((gated_z_edit_layer.size(0)+255)//256) for gated_z_edit_layer in gated_z_edit])
     # else:
@@ -232,61 +226,65 @@ def modify_layers(model, layer_to_modify, insertion_type, activations, strength,
 
     x = err_inp[layer_to_modify]
     y = gld_out[layer_to_modify] - err_out[layer_to_modify]
+    # y[680:] = torch.zeros((569, 896)).to(device)
+    
+    w_up = torch.div(x, (torch.norm(x, dim=1).unsqueeze(-1)**2))
+    # w_up = x
 
-    # w_up = torch.div(x, (torch.norm(x, dim=1).unsqueeze(-1)**2))
-    # # w_up = x
+    plt.imshow(x.cpu().detach().numpy(), vmin=x.min(), vmax=x.max())
+    plt.colorbar()
+    plt.title("x")
+    plt.savefig("x.png")
+    plt.close()
 
-    # plt.imshow(x.cpu().detach().numpy(), vmin=x.min(), vmax=x.max())
-    # plt.colorbar()
-    # plt.title("x")
-    # plt.savefig("x.png")
-    # plt.close()
+    plt.imshow(y.cpu().detach().numpy(), vmin=y.min(), vmax=y.max())
+    plt.colorbar()
+    plt.title("y")
+    plt.savefig("y.png")
+    plt.close()
 
-    # plt.imshow(y.cpu().detach().numpy(), vmin=y.min(), vmax=y.max())
-    # plt.colorbar()
-    # plt.title("y")
-    # plt.savefig("y.png")
-    # plt.close()
-
-    # plt.imshow(w_up.cpu().detach().numpy(), vmin=w_up.min(), vmax=w_up.max())
-    # plt.colorbar()
-    # plt.title("w_up")
-    # plt.savefig("w_up.png")
-    # plt.close()
+    plt.imshow(w_up.cpu().detach().numpy(), vmin=w_up.min(), vmax=w_up.max())
+    plt.colorbar()
+    plt.title("w_up")
+    plt.savefig("w_up.png")
+    plt.close()
 
     # # Get principal components
-    # # u, s, vt = torch.linalg.svd(x)
-    # # uk = u.T[:]
-    # # x = torch.matmul(uk, x)
-    # # y = torch.matmul(uk, y)
-    # # w_up = torch.matmul(uk, w_up)
-    # # w_up = torch.div(x, (torch.norm(x, dim=1).unsqueeze(-1)**2))
+    # u, s, vt = torch.linalg.svd(x)
+    # uk = u.T[:]
+    # x = torch.matmul(uk, x)
+    # y = torch.matmul(uk, y)
+    # w_up = torch.matmul(uk, w_up)
+    # w_up = torch.div(w_up, (torch.norm(w_up, dim=1).unsqueeze(-1)**2))
 
-    # # svd = TruncatedSVD(n_components=x.size(0) - 1, algorithm="arpack")
-    # # x = torch.tensor(svd.fit_transform(x.T.cpu())).to(device).T
-    # # y = torch.tensor(svd.transform(y.T.cpu())).to(device).T
-    # # w_up = torch.tensor(svd.transform(w_up.T.cpu())).to(device).T
-    # # w_up = torch.div(x, (torch.norm(x, dim=1).unsqueeze(-1)**2))
+    # svd = TruncatedSVD(n_components=x.size(0) - 1, algorithm="arpack")
+    # x = torch.tensor(svd.fit_transform(x.T.cpu())).to(device).T
+    # y = torch.tensor(svd.transform(y.T.cpu())).to(device).T
+    # w_up = torch.tensor(svd.transform(w_up.T.cpu())).to(device).T
+    # w_up = torch.div(x, (torch.norm(x, dim=1).unsqueeze(-1)**2))
 
-    # # w_up = torch.div(x, wn.unsqueeze(0)**2)/wn.size(0)
+    # w_up = torch.div(x, wn.unsqueeze(0)**2)/wn.size(0)
 
-    # # w_up = torch.div(x, (torch.norm(x, dim=1).unsqueeze(-1)))
-    # # w_up = torch.div(w_up, wn.unsqueeze(0))/torch.sqrt(torch.tensor(wn.size(0)).to(device))
+    # w_up = torch.div(x, (torch.norm(x, dim=1).unsqueeze(-1)))
+    # w_up = torch.div(w_up, wn.unsqueeze(0))/torch.sqrt(torch.tensor(wn.size(0)).to(device))
 
-    # # x_norm = torch.norm(x, dim=1).unsqueeze(-1)
-    # # w_up = torch.div(x, wn.unsqueeze(0))/torch.sqrt(torch.tensor(wn.size(0)).to(device))
-    # # w_up = torch.div(w_up, x_norm)
+    # x_norm = torch.norm(x, dim=1).unsqueeze(-1)
+    # w_up = torch.div(x, wn.unsqueeze(0))/torch.sqrt(torch.tensor(wn.size(0)).to(device))
+    # w_up = torch.div(w_up, x_norm)
 
-    # z_edit = torch.matmul(x, w_up.T)
-    # print("Z edit before collinearities", z_edit)    
+    z_edit = torch.matmul(x, w_up.T)
+    print("Z edit before collinearities", z_edit)    
     # print("diagonal", torch.diagonal(z_edit))
     # print("off diagonal min", torch.min(z_edit - 0.01*torch.eye(z_edit.size(0)).to(device)))
     # print("off diagonal max", torch.max(z_edit - 0.01*torch.eye(z_edit.size(0)).to(device)))
-    # plt.imshow(z_edit.cpu().detach().numpy(), vmin=z_edit.min(), vmax=z_edit.max())
-    # plt.colorbar()
-    # plt.title("z_edit_pre")
-    # plt.savefig("z_edit_pre.png")
-    # plt.close()
+    plt.imshow(z_edit.cpu().detach().numpy(), vmin=z_edit.min(), vmax=z_edit.max())
+    plt.colorbar()
+    plt.title("z_edit_pre")
+    plt.savefig("z_edit_pre.png")
+    plt.close()
+
+    torch.save(z_edit, "z_edit.pt")
+    torch.save(y, "y.pt")
 
     # collinearities = get_collinearities(z_edit)
     # x = collinearities@x
@@ -294,135 +292,248 @@ def modify_layers(model, layer_to_modify, insertion_type, activations, strength,
     # y = collinearities@y
     # z_edit = collinearities@z_edit@collinearities.T
 
-    # # u, s, vt = torch.linalg.svd(z_edit)
-    # # uk = u.T[:]
-    # # x = uk@x
-    # # w_up = uk@w_up
-    # # y = uk@y
-    # # # z_edit = uk@z_edit@uk.T
-    # # w_up = torch.div(x, (torch.norm(x, dim=1).unsqueeze(-1)**2))
-    # # z_edit = torch.matmul(x, w_up.T)
-    # # w_up = [w_up]
+    # u, s, vt = torch.linalg.svd(z_edit)
+    # uk = u.T[:]
+    # x = uk@x
+    # w_up = uk@w_up
+    # y = uk@y
+    # # z_edit = uk@z_edit@uk.T
+    # w_up = torch.div(x, (torch.norm(x, dim=1).unsqueeze(-1)**2))
+    # z_edit = torch.matmul(x, w_up.T)
+    w_up = [w_up]
 
-    # # svd = TruncatedSVD(n_components=z_edit.size(0) - 1, algorithm="arpack")
-    # # z_edit = torch.tensor(svd.fit_transform(z_edit.T.cpu())).to(device).T
-    # # print("mid zedit", z_edit.size())
-    # # z_edit = torch.tensor(svd.transform(z_edit.cpu())).to(device)
-    # # x = torch.tensor(svd.transform(x.T.cpu())).to(device).T
-    # # y = torch.tensor(svd.transform(y.T.cpu())).to(device).T
-    # # w_up = torch.tensor(svd.transform(w_up.T.cpu())).to(device).T
-    # # w_up = [torch.div(w_up, (torch.norm(x, dim=1).unsqueeze(-1)**2))]
+    # svd = TruncatedSVD(n_components=z_edit.size(0) - 1, algorithm="arpack")
+    # z_edit = torch.tensor(svd.fit_transform(z_edit.T.cpu())).to(device).T
+    # print("mid zedit", z_edit.size())
+    # z_edit = torch.tensor(svd.transform(z_edit.cpu())).to(device)
+    # x = torch.tensor(svd.transform(x.T.cpu())).to(device).T
+    # y = torch.tensor(svd.transform(y.T.cpu())).to(device).T
+    # w_up = torch.tensor(svd.transform(w_up.T.cpu())).to(device).T
+    # w_up = [torch.div(w_up, (torch.norm(x, dim=1).unsqueeze(-1)**2))]
 
-    # gated_z_edit = z_edit*(z_edit - treshold)*torch.nn.functional.sigmoid(strength*(z_edit - treshold))
-    # # gated_z_edit = (z_edit + (1 / ((1-treshold) * torch.nn.functional.sigmoid(torch.tensor(strength*(1-treshold))))) - 1)*(z_edit - treshold)*torch.nn.functional.sigmoid(strength*(z_edit - treshold))
-    # # gated_z_edit = (z_edit + BIAS_UP)*(z_edit - treshold)*torch.nn.functional.sigmoid(strength*(z_edit - treshold))
-    # print("Z edit", z_edit)    
-    # print("diagonal", torch.diagonal(z_edit))
+    gated_z_edit = z_edit*(z_edit - treshold)*torch.nn.functional.sigmoid(strength*(z_edit - treshold))
+    # gated_z_edit = (z_edit + (1 / ((1-treshold) * torch.nn.functional.sigmoid(torch.tensor(strength*(1-treshold))))) - 1)*(z_edit - treshold)*torch.nn.functional.sigmoid(strength*(z_edit - treshold))
+    # gated_z_edit = (z_edit + BIAS_UP)*(z_edit - treshold)*torch.nn.functional.sigmoid(strength*(z_edit - treshold))
+    print("Z edit", z_edit)    
+    print("diagonal", torch.diagonal(z_edit))
     # print("off diagonal min", torch.min(z_edit - 0.01*torch.eye(z_edit.size(0)).to(device)))
     # print("off diagonal max", torch.max(z_edit - 0.01*torch.eye(z_edit.size(0)).to(device)))
+    print("Default Condition number", torch.linalg.cond(gated_z_edit))
+    # P = torch.diag(1.0 / torch.sqrt(torch.diag(gated_z_edit) + 1e-6))  # Avoid division by zero
 
-    # # print("Collinearities", collinearities)
-    # print("Gated z edit", gated_z_edit)    
-    # print("diagonal", torch.diagonal(gated_z_edit))
+    # u, s, v = torch.linalg.svd(gated_z_edit)
+    # P = u.T[:] 
+    # gated_z_edit = P @ gated_z_edit @ P.T
+    # y = torch.matmul(P, y)
+
+    best_lamb = 0
+    best_mse = 10000000000
+    for lamb in [1e-1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6, 1e-7, 1e-8]:
+        reg_gated_z_edit = gated_z_edit + lamb*torch.eye(gated_z_edit.size(0)).to(device)
+        condition_number = torch.linalg.cond(reg_gated_z_edit)
+        if condition_number < 1e9:
+            mse = torch.mean((torch.matmul(gated_z_edit, torch.linalg.solve(reg_gated_z_edit, y)) - y) ** 2)
+            print("Lamb", lamb, "MSE:", mse, "Condition number", condition_number)
+            if mse < best_mse:
+                best_mse = mse
+                best_lamb = lamb
+
+    print("Best lamb", best_lamb)
+
+    gated_z_edit += best_lamb * torch.eye(gated_z_edit.size(0)).to(device)
+    print("Deconditioned Condition number", torch.linalg.cond(gated_z_edit))
+
+    w_down = [torch.linalg.solve(gated_z_edit, y).T]
+    # w_down = [torch.matmul(P.T, w_down[0].T).T]
+
+    n_new_vecs = 256 * ((gated_z_edit.size(0)+255)//256)
+
+    # print("Collinearities", collinearities)
+    print("Gated z edit", gated_z_edit)    
+    print("diagonal", torch.diagonal(gated_z_edit))
     # print("off diagonal min", torch.min(gated_z_edit - 0.01*torch.eye(gated_z_edit.size(0)).to(device)))
     # print("off diagonal max", torch.max(gated_z_edit - 0.01*torch.eye(gated_z_edit.size(0)).to(device)))
-    # print("size", gated_z_edit.size())
-    # plt.imshow(gated_z_edit.cpu().detach().numpy(), vmin=gated_z_edit.min(), vmax=gated_z_edit.max())
-    # plt.colorbar()
-    # plt.title("gated_z_edit")
-    # plt.savefig("gated_z_edit.png")
-    # plt.close()
+    print("size", gated_z_edit.size())
+    plt.imshow(gated_z_edit.cpu().detach().numpy(), vmin=gated_z_edit.min(), vmax=gated_z_edit.max())
+    plt.colorbar()
+    plt.title("gated_z_edit")
+    plt.savefig("gated_z_edit.png")
+    plt.close()
 
-    # plt.imshow(z_edit.cpu().detach().numpy(), vmin=z_edit.min(), vmax=z_edit.max())
-    # plt.colorbar()
-    # plt.title("z_edit")
-    # plt.savefig("z_edit.png")
-    # plt.close()
+    plt.imshow(z_edit.cpu().detach().numpy(), vmin=z_edit.min(), vmax=z_edit.max())
+    plt.colorbar()
+    plt.title("z_edit")
+    plt.savefig("z_edit.png")
+    plt.close()
 
-    # plt.imshow(x.cpu().detach().numpy(), vmin=x.min(), vmax=x.max())
-    # plt.colorbar()
-    # plt.title("x_post")
-    # plt.savefig("x_post.png")
-    # plt.close()
+    plt.imshow(x.cpu().detach().numpy(), vmin=x.min(), vmax=x.max())
+    plt.colorbar()
+    plt.title("x_post")
+    plt.savefig("x_post.png")
+    plt.close()
 
-    # plt.imshow(y.cpu().detach().numpy(), vmin=y.min(), vmax=y.max())
-    # plt.colorbar()
-    # plt.title("y_post")
-    # plt.savefig("y_post.png")
-    # plt.close()
+    plt.imshow(y.cpu().detach().numpy(), vmin=y.min(), vmax=y.max())
+    plt.colorbar()
+    plt.title("y_post")
+    plt.savefig("y_post.png")
+    plt.close()
 
-    # plt.imshow(w_up[0].cpu().detach().numpy(), vmin=w_up[0].min(), vmax=w_up[0].max())
-    # plt.colorbar()
-    # plt.title("w_up_post")
-    # plt.savefig("w_up_post.png")
-    # plt.close()
-
-
-    # w_down = [torch.linalg.solve(gated_z_edit, y).T]
-
-    # n_new_vecs = 256 * ((gated_z_edit.size(0)+255)//256)
-    
-    # print("Condition number", torch.linalg.cond(gated_z_edit))
-    # if torch.linalg.cond(gated_z_edit) > 10:
-    #     print("Condition number too high")
-
-    # print("Norm diff:", torch.norm(torch.matmul(gated_z_edit, w_down[0].T) - y))
-
-    # y[313:] = torch.zeros((223, 896)).to(device)
+    plt.imshow(w_up[0].cpu().detach().numpy(), vmin=w_up[0].min(), vmax=w_up[0].max())
+    plt.colorbar()
+    plt.title("w_up_post")
+    plt.savefig("w_up_post.png")
+    plt.close()
         
-    n_new_vecs = 2048
-    config = Qwen2ModifiedConfig(
-        hidden_act="silu",
-        hidden_size=896,
-        intermediate_size=1249
-        # intermediate_size=271
-    )
-    edit_mlp = Qwen2MLP(config).to(device)
-    optimizer = torch.optim.Adam(edit_mlp.parameters(), lr=3e-5)
-    loss_fn = torch.nn.MSELoss()
+    # l1 = torch.nn.L1Loss()
+    # mse = torch.nn.MSELoss()
+    # cosine_sim = torch.nn.CosineSimilarity(dim=1)
     
-    dataset = TensorDataset(x, y)
-    train_loader = DataLoader(dataset, batch_size=128, shuffle=True)
-    best_model = edit_mlp
-    best_loss = 10000000000
+    # dataset = TensorDataset(x, y)
+    # train_loader = DataLoader(dataset, batch_size=128, shuffle=True)
 
-    epochs = 1000
-    for epoch in range(epochs):
-        edit_mlp.train()
+    # config = Qwen2ModifiedConfig(
+    #     hidden_act="silu",
+    #     hidden_size=896,
+    #     intermediate_size=125
+    # )
+    # edit_mlp = Qwen2MLP(config).to(device)
+    # optimizer = torch.optim.Adam(edit_mlp.parameters(), lr=1e-4, weight_decay=1e-4)
+    # print("Edit MLP", edit_mlp.up_proj.weight.size(), edit_mlp.gate_proj.weight.size(), edit_mlp.down_proj.weight.size())
+    # best_model = edit_mlp
+    # best_loss = 10000000000
+    # best_lr = 1e-4
 
-        running_loss = 0.0
-        for batch_idx, (batch_x, batch_y) in enumerate(train_loader):
+    # # for lr in [1e-2, 5e-3, 3e-3, 1e-3, 5e-4, 3e-4, 1e-4, 5e-5, 3e-5, 1e-5, 5e-6, 3e-6, 1e-6]:
+    # for lr in [3e-3, 1e-3, 3e-4, 1e-4, 3e-5, 1e-5, 3e-6, 1e-6]:
+    #     # for nn_size in [12, 25, 50, 125, 250, 500, 1000]:
+    #     for nn_size in [12, 125, 1249, 2500]:
+    #         config = Qwen2ModifiedConfig(
+    #             hidden_act="silu",
+    #             hidden_size=896,
+    #             intermediate_size=nn_size
+    #         )
+    #         edit_mlp = Qwen2MLP(config).to(device)
+    #         # edit_mlp.up_proj.weight = torch.nn.Parameter(1.14*torch.div(x, (torch.norm(x, dim=1).unsqueeze(-1)**2)))
+    #         # edit_mlp.gate_proj.weight = torch.nn.Parameter(1.14*torch.div(x, (torch.norm(x, dim=1).unsqueeze(-1)**2)))
+    #         # edit_mlp.down_proj.weight = torch.nn.Parameter(y.T)
+    #         # edit_mlp.up_proj.weight = torch.nn.Parameter(w_up[0])
+    #         # edit_mlp.gate_proj.weight = torch.nn.Parameter(w_up[0])
+    #         # edit_mlp.down_proj.weight = torch.nn.Parameter(w_down[0])
+    #         optimizer = torch.optim.Adam(edit_mlp.parameters(), lr=lr, weight_decay=1e-4)
+    #         for epoch in range(1000):
+    #             edit_mlp.train()
 
-            predictions = edit_mlp(batch_x)
-            loss = loss_fn(predictions, batch_y)
+    #             running_loss = 0.0
+    #             for batch_idx, (batch_x, batch_y) in enumerate(train_loader):
 
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(edit_mlp.parameters(), 1.0)
-            optimizer.step()
+    #                 predictions = edit_mlp(batch_x)
+    #                 loss = mse(predictions, batch_y)
+    #                 # loss = mse(predictions, batch_y) + 100000*torch.mean((edit_mlp.up_proj.weight-1.14*torch.div(x, (torch.norm(x, dim=1).unsqueeze(-1)**2)))**2) + 100000*torch.mean((edit_mlp.gate_proj.weight-1.14*torch.div(x, (torch.norm(x, dim=1).unsqueeze(-1)**2)))**2) + 1000*torch.mean((edit_mlp.down_proj.weight-y.T)**2)
+    #                 # loss = l1(predictions, batch_y) - torch.log(torch.nn.functional.sigmoid(cosine_sim(predictions, batch_y))).mean()
 
-            running_loss += loss.item()
+    #                 optimizer.zero_grad()
+    #                 loss.backward()
+    #                 torch.nn.utils.clip_grad_norm_(edit_mlp.parameters(), 1.0)
+    #                 optimizer.step()
 
-        avg_loss = running_loss / len(train_loader)
+    #                 running_loss += loss.item()
 
-        if avg_loss < best_loss:
-            best_loss = avg_loss
-            best_model_state_dict = edit_mlp.state_dict()   
+    #             avg_loss = running_loss / len(train_loader)
 
-        if epoch % 5 == 0:
-            print(f"Epoch {epoch}/{epochs}, Loss: {avg_loss}")
+    #             if avg_loss < best_loss:
+    #                 best_loss = avg_loss
+    #                 best_lr = lr
+    #                 best_nn_size = nn_size
+    #                 best_model_state_dict = edit_mlp.state_dict()
 
-    best_model = Qwen2MLP(config).to(device)
-    best_model.load_state_dict(best_model_state_dict)
-    best_model.eval()
+    #         print(f"LR {lr} NN SIZE {nn_size}, Loss: {avg_loss}")
 
-    w_up = [best_model.up_proj.weight]
-    w_gate = [best_model.gate_proj.weight]
-    w_down = [best_model.down_proj.weight]
-    w_up_bias = best_model.up_proj.bias
-    w_gate_bias = best_model.gate_proj.bias
-    print(w_up[0].size(), w_gate[0].size(), w_down[0].size(), w_up_bias.size(), w_gate_bias.size())
+    # # best_lr = 1e-4
+    # # best_nn_size = int(x.size(0) * 0.1)
+    # # best_nn_size = x.size(0)
+    # n_new_vecs = best_nn_size + 1
+    # print("Best LR:", best_lr)
+    # print("Best NN size:", best_nn_size)
+    # config = Qwen2ModifiedConfig(
+    #     hidden_act="silu",
+    #     hidden_size=896,
+    #     intermediate_size=best_nn_size
+    # )
+    # edit_mlp = Qwen2MLP(config).to(device)
+    # optimizer = torch.optim.Adam(edit_mlp.parameters(), lr=best_lr, weight_decay=1e-4)
+    # print("Edit MLP", edit_mlp.up_proj.weight.size(), edit_mlp.gate_proj.weight.size(), edit_mlp.down_proj.weight.size())
+    # best_model = edit_mlp
+    # best_loss = 10000000000
 
+
+    # # edit_mlp.up_proj.weight = torch.nn.Parameter(1.14*torch.div(x, (torch.norm(x, dim=1).unsqueeze(-1)**2)), requires_grad=True)
+    # # edit_mlp.gate_proj.weight = torch.nn.Parameter(1.14*torch.div(x, (torch.norm(x, dim=1).unsqueeze(-1)**2)), requires_grad=True)
+    # # edit_mlp.down_proj.weight = torch.nn.Parameter(y.T)
+    # # edit_mlp.up_proj.weight = torch.nn.Parameter(w_up[0])
+    # # edit_mlp.gate_proj.weight = torch.nn.Parameter(w_up[0])
+    # # edit_mlp.down_proj.weight = torch.nn.Parameter(w_down[0])
+    # # best_model_state_dict = edit_mlp.state_dict()
+
+    # print("Edit MLP", edit_mlp.up_proj.weight.size(), edit_mlp.gate_proj.weight.size(), edit_mlp.down_proj.weight.size())
+
+    # plt.hist(torch.norm(1.14*torch.div(x, (torch.norm(x, dim=1).unsqueeze(-1)**2)), dim=1).cpu())
+    # plt.savefig("x_norms.png")
+    # plt.close()
+    # plt.hist(torch.norm(y.T, dim=1).cpu())
+    # plt.savefig("y_norms.png")
+    # plt.close()
+
+    # epochs = 1000
+    # for epoch in range(epochs):
+    #     edit_mlp.train()
+
+    #     running_loss = 0.0
+    #     for batch_idx, (batch_x, batch_y) in enumerate(train_loader):
+
+    #         predictions = edit_mlp(batch_x)
+    #         # loss = l1(predictions, batch_y) + mse(predictions, batch_y) - torch.log(torch.nn.functional.sigmoid(cosine_sim(predictions, batch_y))).mean() 
+    #         # loss = mse(predictions, batch_y)
+    #         # loss = mse(predictions, batch_y) + 100000*torch.mean((edit_mlp.up_proj.weight-1.14*torch.div(x, (torch.norm(x, dim=1).unsqueeze(-1)**2)))**2) + 100000*torch.mean((edit_mlp.gate_proj.weight-1.14*torch.div(x, (torch.norm(x, dim=1).unsqueeze(-1)**2)))**2) + 1000*torch.mean((edit_mlp.down_proj.weight-y.T)**2)
+    #         loss = mse(predictions, batch_y)
+    #         # loss = mse(predictions, batch_y) -torch.log(torch.nn.functional.sigmoid(cosine_sim(predictions, batch_y))).mean()
+    #         # loss = l1(predictions, batch_y) - torch.log(torch.nn.functional.sigmoid(cosine_sim(predictions, batch_y))).mean()
+
+    #         optimizer.zero_grad()
+    #         loss.backward()
+    #         torch.nn.utils.clip_grad_norm_(edit_mlp.parameters(), 1.0)
+    #         optimizer.step()
+
+    #         running_loss += loss.item()
+
+    #     avg_loss = running_loss / len(train_loader)
+
+    #     if avg_loss < best_loss:
+    #         best_loss = avg_loss
+    #         best_model_state_dict = edit_mlp.state_dict()   
+
+    #     if epoch % 5 == 0:
+    #         print(f"Epoch {epoch}/{epochs}, Loss: {avg_loss}")
+
+    # best_model = Qwen2MLP(config).to(device)
+    # best_model.load_state_dict(best_model_state_dict)
+    # best_model.eval()
+    # plt.hist(torch.norm(best_model.up_proj.weight, dim=1).cpu().detach())
+    # plt.savefig("w_up_norms.png")
+    # plt.close()
+    # plt.hist(torch.norm(best_model.gate_proj.weight, dim=1).cpu().detach())
+    # plt.savefig("w_gate_norms.png")
+    # plt.close()
+    # plt.hist(torch.norm(best_model.down_proj.weight, dim=1).cpu().detach())
+    # plt.savefig("w_down_norms.png")
+    # plt.close()
+
+    # w_up = [best_model.up_proj.weight]
+    # w_gate = [best_model.gate_proj.weight]
+    # w_down = [best_model.down_proj.weight]
+    # w_up_bias = best_model.up_proj.bias
+    # w_gate_bias = best_model.gate_proj.bias
+    # print(w_up[0].size(), w_gate[0].size(), w_down[0].size(), w_up_bias.size(), w_gate_bias.size())
+    # print("Norm diff:", torch.norm(best_model(x) - y))
 
 
 
@@ -620,22 +731,22 @@ def modify_layers(model, layer_to_modify, insertion_type, activations, strength,
                 if insertion_type == "all":
                     w_up_layer = w_up[layer]
                 else:
-                    if n.endswith(".mlp.gate_proj"):
-                        w_up_layer = w_gate[0]
-                    else:
-                        w_up_layer = w_up[0]
+                    # if n.endswith(".mlp.gate_proj"):
+                    #     w_up_layer = w_gate[0]
+                    # else:
+                    w_up_layer = w_up[0]
                 with torch.no_grad():
                     if n.endswith(".mlp.gate_proj"):
                         w[-n_new_vecs:-n_new_vecs+w_up_layer.size(0)] = w_up_layer*strength
                         # w[-n_new_vecs:-n_new_vecs+w_up_layer.size(0)] = w_up_layer*strength
                         # b[-n_new_vecs:-n_new_vecs+w_up_layer.size(0)] = -treshold*strength
-                        b[-n_new_vecs:-n_new_vecs+w_up_layer.size(0)] = w_gate_bias
+                        # b[-n_new_vecs:-n_new_vecs+w_up_layer.size(0)] = w_gate_bias
                     else:
                         w[-n_new_vecs:-n_new_vecs+w_up_layer.size(0)] = w_up_layer*(1/strength)
                         # w[-n_new_vecs:-n_new_vecs+w_up_layer.size(0)] = w_up_layer*(1/strength)
                         # b[-n_new_vecs:-n_new_vecs+w_up_layer.size(0)] = (1/strength)*((1 / ((1-treshold) * torch.nn.functional.sigmoid(torch.tensor(strength*(1-treshold))))) - 1)
                         # b[-n_new_vecs:-n_new_vecs+w_up_layer.size(0)] = (1/strength)*BIAS_UP
-                        b[-n_new_vecs:-n_new_vecs+w_up_layer.size(0)] = w_up_bias
+                        # b[-n_new_vecs:-n_new_vecs+w_up_layer.size(0)] = w_up_bias
             m.weight = torch.nn.Parameter(w)
             m.bias = torch.nn.Parameter(b)
         elif n.endswith(".mlp.down_proj"):
